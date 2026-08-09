@@ -1,27 +1,31 @@
-//! `lite-harness` CLI — Phase 1 skeleton (architecture §2, §11 phase 1).
+//! `lite-harness` CLI (architecture §2, §11 phase 2).
 //!
-//! Connects to the per-workspace daemon over its Unix domain socket,
-//! auto-spawning it if it isn't already running, then drives one session
-//! and prints the streamed events. Proves the "CLI is a thin client, never
-//! load-bearing for the agent loop" property end to end -- there is no
-//! agent logic in this binary at all.
+//! Connects to the per-workspace daemon, sends one real prompt via
+//! `session/prompt`, renders the streamed events, and answers permission
+//! requests interactively over stdin -- still a thin client with zero
+//! agent logic of its own; every decision it makes is either "print this
+//! event" or "forward this human answer back to the daemon."
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use lh_event::{ContentBlock, Event, EventPayload};
+use lh_event::{ContentBlock, Event, EventPayload, PermissionDecision};
 use lh_protocol::{
     buffered, default_socket_path, methods, read_message, write_message, InitializeParams,
-    InitializeResult, Message, Request, RequestId, SessionCreateParams, SessionCreateResult,
-    PROTOCOL_VERSION,
+    InitializeResult, Message, PermissionRespondParams, Request, RequestId, SessionCreateParams,
+    SessionCreateResult, SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
 };
-use tokio::io::{AsyncBufRead, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tokio::net::UnixStream;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let prompt = std::env::args().nth(1).ok_or_else(|| {
+        anyhow!("usage: lite-harness <prompt>\n  e.g. lite-harness \"list the files in this directory\"")
+    })?;
+
     let cwd = std::env::current_dir()?;
     let sock_path = default_socket_path(&cwd);
 
@@ -40,10 +44,7 @@ async fn main() -> Result<()> {
         })?,
     )
     .await?;
-    eprintln!(
-        "connected to daemon (protocol v{})",
-        init_result.protocol_version
-    );
+    eprintln!("connected to daemon (protocol v{})", init_result.protocol_version);
 
     let create_result: SessionCreateResult = request(
         &mut write_half,
@@ -57,20 +58,69 @@ async fn main() -> Result<()> {
     .await?;
     eprintln!("session {} created\n", create_result.session_id);
 
+    let prompt_id = next_id;
+    next_id += 1;
+    write_message(
+        &mut write_half,
+        &Message::Request(Request::new(
+            prompt_id,
+            methods::SESSION_PROMPT,
+            serde_json::to_value(SessionPromptParams { text: prompt })?,
+        )),
+    )
+    .await?;
+
+    let mut stdin = buffered(tokio::io::stdin());
+
     loop {
         match read_message(&mut reader).await? {
             Some(Message::Notification(n)) if n.method == methods::EVENT => {
                 let event: Event = serde_json::from_value(n.params)?;
                 print_event(&event);
+
+                if let EventPayload::PermissionRequested { call_id, request: perm_req } =
+                    &event.payload
+                {
+                    let decision = ask_for_decision(&mut stdin, perm_req).await?;
+                    let respond_id = next_id;
+                    next_id += 1;
+                    write_message(
+                        &mut write_half,
+                        &Message::Request(Request::new(
+                            respond_id,
+                            methods::PERMISSION_RESPOND,
+                            serde_json::to_value(PermissionRespondParams {
+                                call_id: call_id.clone(),
+                                decision,
+                            })?,
+                        )),
+                    )
+                    .await?;
+                }
+            }
+            Some(Message::Response(resp)) if resp.id == prompt_id => {
+                if let Some(err) = resp.error {
+                    eprintln!("\n[turn failed] {}", err.message);
+                } else {
+                    let result: SessionPromptResult =
+                        serde_json::from_value(resp.result.unwrap_or_default())?;
+                    println!("\n[turn complete: {}]", result.stop_reason);
+                }
+                break;
+            }
+            Some(Message::Response(_)) => {
+                // Almost certainly the ack for our permission/respond request.
             }
             Some(other) => {
                 eprintln!("[unexpected message] {other:?}");
             }
-            None => break, // daemon closed the connection: canned sequence is done
+            None => {
+                eprintln!("\n[daemon closed the connection]");
+                break;
+            }
         }
     }
 
-    println!();
     Ok(())
 }
 
@@ -98,9 +148,6 @@ async fn request<T: serde::de::DeserializeOwned>(
                     .ok_or_else(|| anyhow!("{method} response had neither result nor error"))?;
                 return Ok(serde_json::from_value(result)?);
             }
-            // Ignore anything else while waiting for this specific response
-            // (there is nothing else in Phase 1, but real sessions may
-            // interleave permission requests etc. here later).
             _ => continue,
         }
     }
@@ -149,6 +196,47 @@ fn daemon_binary_path() -> Result<PathBuf> {
     Ok(dir.join(name))
 }
 
+async fn ask_for_decision(
+    stdin: &mut (impl AsyncBufRead + Unpin),
+    request: &lh_event::PermissionRequest,
+) -> Result<PermissionDecision> {
+    println!(
+        "\n  [permission] {:?} / {:?}: {}",
+        request.risk_tier,
+        request.tool_source,
+        describe_action(&request.action)
+    );
+    print!("  allow? [y/N]: ");
+    std::io::stdout().flush().ok();
+
+    let mut line = String::new();
+    stdin.read_line(&mut line).await?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(if answer == "y" || answer == "yes" {
+        PermissionDecision::Allow
+    } else {
+        PermissionDecision::Deny
+    })
+}
+
+fn describe_action(action: &lh_event::PermissionAction) -> String {
+    match action {
+        lh_event::PermissionAction::FileRead { path } => format!("read {}", path.display()),
+        lh_event::PermissionAction::FileWrite { path, .. } => format!("write {}", path.display()),
+        lh_event::PermissionAction::Exec { command, .. } => format!("execute: {command}"),
+        lh_event::PermissionAction::NetworkFetch { url } => format!("fetch {url}"),
+        lh_event::PermissionAction::McpToolCall { server, tool, .. } => {
+            format!("mcp {server}/{tool}")
+        }
+        lh_event::PermissionAction::DelegatedAgentToolCall { agent, .. } => {
+            format!("delegated call via {agent:?}")
+        }
+        lh_event::PermissionAction::DelegateAgent { target, task_summary } => {
+            format!("delegate to {target:?}: {task_summary}")
+        }
+    }
+}
+
 fn print_event(event: &Event) {
     match &event.payload {
         EventPayload::UserMessage { content } => {
@@ -168,6 +256,12 @@ fn print_event(event: &Event) {
         EventPayload::ToolCallUpdated { call_id, status, .. } => {
             println!("  <- {call_id} {status:?}");
         }
+        EventPayload::PermissionRequested { .. } => {
+            // rendered by ask_for_decision, which runs right after this event
+        }
+        EventPayload::PermissionDecided { decision, .. } => {
+            println!("  [decision: {decision:?}]");
+        }
         EventPayload::UsageReported { usage } => {
             println!(
                 "\n  [usage] in={:?} out={:?} cost=${:?} ({:?}, {}ms)",
@@ -176,6 +270,9 @@ fn print_event(event: &Event) {
         }
         EventPayload::SessionDriverSet { driver } => {
             eprintln!("[session driver: {driver:?}]");
+        }
+        EventPayload::Error { message, recoverable } => {
+            eprintln!("\n[error{}] {message}", if *recoverable { " (recoverable)" } else { "" });
         }
         other => {
             println!("[{:?}] {other:?}", event.actor);

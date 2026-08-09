@@ -4,6 +4,9 @@ members = [
     "crates/lh-event",
     "crates/lh-store",
     "crates/lh-protocol",
+    "crates/lh-model-provider",
+    "crates/lh-permission",
+    "crates/lh-native-agent",
     "crates/lh-daemon",
     "crates/lh-cli",
 ]
@@ -23,3 +26,7 @@ thiserror = "1"
 anyhow = "1"
 futures = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+toml = "0.8"
+wiremock = "0.6"
+tempfile = "3"

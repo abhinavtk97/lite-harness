@@ -11,8 +11,12 @@ path = "src/main.rs"
 lh-event = { path = "../lh-event" }
 lh-store = { path = "../lh-store" }
 lh-protocol = { path = "../lh-protocol" }
+lh-model-provider = { path = "../lh-model-provider" }
+lh-permission = { path = "../lh-permission" }
+lh-native-agent = { path = "../lh-native-agent" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
+async-trait.workspace = true

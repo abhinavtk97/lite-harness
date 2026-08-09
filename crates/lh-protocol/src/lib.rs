@@ -118,7 +118,9 @@ impl<'de> Deserialize<'de> for JsonRpcVersion {
 pub mod methods {
     pub const INITIALIZE: &str = "initialize";
     pub const SESSION_CREATE: &str = "session/create";
+    pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_TREE: &str = "session/tree";
+    pub const PERMISSION_RESPOND: &str = "permission/respond";
     /// Streamed daemon -> client notification carrying an `lh_event::Event`.
     pub const EVENT: &str = "event";
 }
@@ -143,6 +145,22 @@ pub struct SessionCreateParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateResult {
     pub session_id: lh_event::SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPromptParams {
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPromptResult {
+    pub stop_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRespondParams {
+    pub call_id: String,
+    pub decision: lh_event::PermissionDecision,
 }
 
 // --- Newline-delimited JSON framing ---
