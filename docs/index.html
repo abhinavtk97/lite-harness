@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lite-harness — Agent Harness Research</title>
+<meta name="description" content="Problem statement, requirements, and landscape research for designing lite-harness, a UI-decoupled AI coding-agent harness.">
+<style>
+  :root {
+    --bg: #f7f7f5;
+    --bg-elevated: #ffffff;
+    --text: #1c1c1a;
+    --text-dim: #55554f;
+    --border: #dedad2;
+    --accent: #9a5b32;
+    --accent-bg: #f3e6da;
+    --code-bg: #efece4;
+    --tag-open: #8a6d1a;
+    --tag-open-bg: #faf1d6;
+    --tag-active: #2f6b46;
+    --tag-active-bg: #e3f1e7;
+    --tag-gone: #a13f3f;
+    --tag-gone-bg: #f8e6e6;
+    --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #171613;
+      --bg-elevated: #201f1b;
+      --text: #ece8df;
+      --text-dim: #b3ada0;
+      --border: #37342c;
+      --accent: #e0a172;
+      --accent-bg: #332419;
+      --code-bg: #262420;
+      --tag-open: #e0c25f;
+      --tag-open-bg: #332c14;
+      --tag-active: #7cc79a;
+      --tag-active-bg: #16301f;
+      --tag-gone: #e08a8a;
+      --tag-gone-bg: #33191a;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #171613;
+    --bg-elevated: #201f1b;
+    --text: #ece8df;
+    --text-dim: #b3ada0;
+    --border: #37342c;
+    --accent: #e0a172;
+    --accent-bg: #332419;
+    --code-bg: #262420;
+    --tag-open: #e0c25f;
+    --tag-open-bg: #332c14;
+    --tag-active: #7cc79a;
+    --tag-active-bg: #16301f;
+    --tag-gone: #e08a8a;
+    --tag-gone-bg: #33191a;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 920px; margin: 0 auto; padding: 3rem 1.5rem 6rem; }
+
+  header.hero { margin-bottom: 3rem; }
+  .eyebrow {
+    display: inline-block;
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--accent-bg);
+    padding: 0.25rem 0.6rem;
+    border-radius: 999px;
+    font-weight: 600;
+    margin-bottom: 1rem;
+  }
+  h1 {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    margin: 0 0 0.75rem;
+    letter-spacing: -0.01em;
+  }
+  .subtitle { color: var(--text-dim); font-size: 1.1rem; max-width: 60ch; }
+
+  h2 {
+    font-size: 1.4rem;
+    margin: 3rem 0 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; }
+  p { color: var(--text); }
+  p.dim, li.dim { color: var(--text-dim); }
+
+  .card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    box-shadow: var(--shadow);
+    margin-bottom: 1rem;
+  }
+
+  .status-banner {
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+    background: var(--tag-open-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+  }
+  .status-banner .dot {
+    flex-shrink: 0;
+    width: 0.6rem; height: 0.6rem;
+    border-radius: 50%;
+    background: var(--tag-open);
+    margin-top: 0.5rem;
+  }
+  .status-banner strong { color: var(--tag-open); }
+
+  ul { padding-left: 1.3rem; }
+  li { margin-bottom: 0.5rem; }
+
+  code {
+    background: var(--code-bg);
+    padding: 0.1rem 0.4rem;
+    border-radius: 5px;
+    font-size: 0.9em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  .doc-links {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.9rem;
+    margin-top: 1rem;
+  }
+  .doc-link {
+    display: block;
+    text-decoration: none;
+    color: inherit;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem 1.2rem;
+    box-shadow: var(--shadow);
+    transition: transform 0.12s ease, border-color 0.12s ease;
+  }
+  .doc-link:hover { transform: translateY(-2px); border-color: var(--accent); }
+  .doc-link .title { font-weight: 600; margin-bottom: 0.25rem; }
+  .doc-link .desc { font-size: 0.88rem; color: var(--text-dim); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+  }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elevated); box-shadow: var(--shadow); }
+  th, td {
+    text-align: left;
+    padding: 0.6rem 0.8rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { color: var(--text-dim); font-weight: 600; white-space: nowrap; }
+  tr:last-child td { border-bottom: none; }
+  .tag {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .tag-active { color: var(--tag-active); background: var(--tag-active-bg); }
+  .tag-gone { color: var(--tag-gone); background: var(--tag-gone-bg); }
+
+  .principles { list-style: none; padding: 0; counter-reset: p; }
+  .principles li {
+    counter-increment: p;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.85rem 1rem 0.85rem 3rem;
+    margin-bottom: 0.6rem;
+    position: relative;
+  }
+  .principles li::before {
+    content: counter(p);
+    position: absolute;
+    left: 1rem; top: 0.8rem;
+    font-weight: 700;
+    color: var(--accent);
+    font-size: 0.9rem;
+  }
+
+  footer {
+    margin-top: 4rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <span class="eyebrow">lite-harness · design research</span>
+    <h1>Researching the agent-harness landscape</h1>
+    <p class="subtitle">Before designing <code>lite-harness</code>, we surveyed 20+ existing AI coding-agent harnesses and orchestration frameworks to find out what they solve well, what they get wrong, and what nobody has built yet.</p>
+  </header>
+
+  <div class="status-banner">
+    <div class="dot"></div>
+    <div>
+      <strong>Status: research phase.</strong> No architecture decisions have been made yet. This page presents the problem statement, the requirements as understood so far, and the full landscape survey. Open questions that still need answers before the design phase starts are listed at the bottom.
+    </div>
+  </div>
+
+  <section>
+    <h2>Problem statement</h2>
+    <div class="card">
+      <p>We want to design and build an AI agent harness — the orchestration layer that runs an LLM agent loop, executes tools, enforces permissions, and manages session/context state.</p>
+      <p>The harness needs to work as:</p>
+      <ul>
+        <li>An interactive <strong>command-line interface</strong>,</li>
+        <li>A <strong>headless / programmatic</strong> interface (CI, scripts, embedding in other agents), and</li>
+        <li>A <strong>web UI</strong>.</li>
+      </ul>
+      <p>Critically, the backend must not be tied to any one of these UIs — the same core engine should be able to drive all three, so a UI is never load-bearing for the agent loop itself.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Requirements (as understood so far)</h2>
+    <div class="card">
+      <ul>
+        <li><strong>UI-agnostic core.</strong> One backend/engine; CLI, headless callers, and web UI are all clients of it, not separate implementations.</li>
+        <li><strong>Multi-surface from the start,</strong> not retrofitted — several harnesses researched (Roo Code, early Cline) had to redo their architecture specifically because headless/CLI support was bolted onto an IDE-shaped core after the fact.</li>
+        <li><strong>Informed by what already exists.</strong> Before locking in an architecture, understand what 20+ comparable systems do well, where they consistently fail, and what almost none of them do at all — see the survey below.</li>
+      </ul>
+      <p class="dim">Requirements will get more specific once the open questions at the bottom of this page are answered — this section will be updated as decisions are made.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Research method</h2>
+    <p>Three parallel research passes, via web search across vendor docs, GitHub issues, postmortems, HN/Reddit discussion, and CVE databases, current as of August 2026:</p>
+    <div class="doc-links">
+      <a class="doc-link" href="research/raw/cli-native-harnesses.md">
+        <div class="title">CLI-native harnesses</div>
+        <div class="desc">Claude Code, OpenAI Codex CLI, Gemini CLI, Aider, Amazon Q Developer CLI, Goose, Cline/Roo Code</div>
+      </a>
+      <a class="doc-link" href="research/raw/ide-integrated-harnesses.md">
+        <div class="title">IDE-integrated harnesses</div>
+        <div class="desc">Cursor, Windsurf, Cline, Roo Code, Continue.dev, GitHub Copilot</div>
+      </a>
+      <a class="doc-link" href="research/raw/autonomous-agents-and-frameworks.md">
+        <div class="title">Autonomous agents &amp; frameworks</div>
+        <div class="desc">Devin, OpenHands, SWE-agent, Google Jules, Replit Agent, LangGraph, AutoGen, CrewAI, Claude Agent SDK, OpenAI Agents SDK, AutoGPT</div>
+      </a>
+      <a class="doc-link" href="research/agent-harness-landscape.md">
+        <div class="title">Full synthesis document</div>
+        <div class="desc">The complete write-up this page summarizes, including all sources and citations</div>
+      </a>
+    </div>
+  </section>
+
+  <section>
+    <h2>Landscape at a glance</h2>
+    <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>Tool</th><th>Category</th><th>Backend/UI decoupling</th><th>Fate</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Claude Code</td><td>CLI-first</td><td>Best-in-class — SDK exports the literal agent loop</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>OpenHands</td><td>Cloud/self-host</td><td>Strongest pattern overall — one append-only EventStream</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>Cline</td><td>IDE + CLI + SDK</td><td>Rebuilt in 2026 into a headless-by-default SDK</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>OpenAI Codex CLI</td><td>CLI-first</td><td>Good — also runs as an MCP server itself</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>Devin</td><td>Cloud-native</td><td>Cloud brain + customer-controlled execution plane ("Outposts")</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>Claude Agent SDK</td><td>Framework/SDK</td><td>4-tier: embed library → CLI subprocess → hosted</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>Gemini CLI</td><td>CLI-first</td><td>Thinner — extension-centric, no exported loop library</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>GitHub Copilot</td><td>IDE + cloud agent</td><td>Split: bound in-IDE mode vs. decoupled Coding Agent</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>Cursor</td><td>IDE (own app)</td><td>CLI headless mode bolted onto an IDE-first core</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>Aider</td><td>CLI/library</td><td>Python-importable, headless by design, no multi-surface UI</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>Goose</td><td>CLI-first</td><td>Modular core, no distinct hosted UI</td><td><span class="tag tag-active">Foundation-governed</span></td></tr>
+        <tr><td>LangGraph</td><td>Framework</td><td>UI-agnostic; pluggable checkpointer abstraction</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>OpenAI Agents SDK</td><td>Framework/SDK</td><td>Stateless core + opt-in persistence layer</td><td><span class="tag tag-active">Active</span></td></tr>
+        <tr><td>Windsurf</td><td>IDE (own app)</td><td>No headless story — explicit non-goal</td><td><span class="tag tag-gone">Acquired by Cognition/Devin</span></td></tr>
+        <tr><td>Roo Code</td><td>IDE (Cline fork)</td><td>Not decoupled — VS Code-bound; CLI retrofitted via shim</td><td><span class="tag tag-gone">Shut down May 2026</span></td></tr>
+        <tr><td>Continue.dev</td><td>IDE + CLI</td><td>Declarative multi-model routing, per-agent sandbox profiles</td><td><span class="tag tag-gone">Acquired by Cursor, repo read-only</span></td></tr>
+        <tr><td>AutoGen/AG2</td><td>Framework</td><td>Conversation-programming; agents as independent actors</td><td><span class="tag tag-gone">Maintenance mode (Microsoft)</span></td></tr>
+        <tr><td>AutoGPT</td><td>Historical</td><td>None — monolithic single-process loop</td><td><span class="tag tag-gone">Pivoted to commercial platform</span></td></tr>
+      </tbody>
+    </table>
+    </div>
+    <p class="dim">Full 24-row table with sandboxing, MCP, and multi-agent columns in the <a href="research/agent-harness-landscape.md">synthesis document</a>.</p>
+  </section>
+
+  <section>
+    <h2>What the research says, distilled</h2>
+
+    <h3>Patterns worth adopting</h3>
+    <ul>
+      <li><strong>One append-only event log as the decoupling substrate</strong> — every interface is a reader/writer of the same log, never calling another interface directly (OpenHands' EventStream, Claude Code's JSONL transcript).</li>
+      <li><strong>A stable, language-agnostic headless interface</strong> with thin SDKs on top, rather than N separate implementations (Claude Code's <code>claude -p</code>, Cline's <code>@cline/sdk</code>).</li>
+      <li><strong>Separate the reasoning plane from the execution plane</strong> — don't hard-wire where the model runs to where side effects happen (Devin's Outposts, GitHub Copilot's Actions-as-sandbox).</li>
+      <li><strong>Layered, pluggable session persistence</strong> — start in-memory/file, graduate to a real store without changing the interface (LangGraph checkpointers, OpenAI Agents SDK sessions).</li>
+      <li><strong>Permission enforcement lives in the core loop, not the UI</strong> — approval-state races and silently-ignored auto-approve flags are a recurring, cross-vendor bug class.</li>
+      <li><strong>Multi-agent orchestration needs explicit state/control-flow</strong>, not free-form conversation — Microsoft moved AutoGen to maintenance mode for exactly this reason.</li>
+    </ul>
+
+    <h3>Recurring pain points across (nearly) every vendor</h3>
+    <ul>
+      <li>Context compaction silently breaking sessions — the single most common failure class in long-running agents.</li>
+      <li>Opaque token/cost accounting — a near-universal complaint, independent of pricing model.</li>
+      <li>"Rogue agent" incidents from missing hard sandboxing — Cursor's self-deletion, Windsurf's CVE, Replit's production-database deletion.</li>
+      <li>MCP servers are the most consistent unguarded edge of otherwise-sandboxed systems (even GitHub Copilot's firewall explicitly excludes them).</li>
+      <li>Vendor consolidation risk is real and recent — three surveyed tools exited independent existence during this research window alone.</li>
+    </ul>
+
+    <h3>What almost nobody does well — candidate differentiators</h3>
+    <ul>
+      <li>Real-time, legible cost/token accounting as a first-class UX surface.</li>
+      <li>Side-effect-aware checkpointing (filesystem <em>and</em> external state like a database, not just conversation history).</li>
+      <li>Governance/policy control over MCP servers.</li>
+      <li>A harness natively decoupled from day one, rather than retrofitted after the fact.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Design principles carried forward</h2>
+    <ol class="principles">
+      <li>One core agent loop, expressed as a reader/writer of a single append-only event log.</li>
+      <li>Ship a stable, versioned headless protocol first; CLI, SDK, and web backend are three clients of it.</li>
+      <li>Decouple where the model reasons from where tools execute.</li>
+      <li>Design session/state persistence as a pluggable backend behind one interface.</li>
+      <li>Treat permission enforcement as a property of the core loop, not the UI.</li>
+      <li>Make irreversible/destructive actions require a structural gate, not a prompted one.</li>
+      <li>Prefer explicit, typed multi-agent state/control-flow over free-form conversation.</li>
+      <li>Build cost/token accounting and tracing in from the start, as a non-invasive side channel.</li>
+      <li>Design tool primitives for the model's failure modes, not by wrapping raw OS primitives.</li>
+      <li>Treat MCP governance as a first-class concern, not an afterthought.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Decisions made so far</h2>
+    <div class="card">
+      <p class="dim">None yet. The team has completed the research phase and agreed on the design principles above as inputs. No decisions have been made on language/runtime, deployment model, multi-agent scope, or provider strategy — see open questions below.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Open questions before the design phase starts</h2>
+    <div class="card">
+      <ul>
+        <li>Target primary language/runtime for the core engine (TypeScript/Node, Python, Rust, Go)?</li>
+        <li>Local-first vs. cloud-hosted-first vs. both from day one?</li>
+        <li>Single-agent to start, or multi-agent (supervisor/subagent) as a v1 requirement?</li>
+        <li>Which model providers must be supported at launch — Anthropic-only, or provider-agnostic BYO-key from day one?</li>
+        <li>Which 1–2 differentiator candidates should <code>lite-harness</code> actually lead with?</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>
+    Research current as of August 2026. Full citations and sources are in the linked documents. This page and the underlying research live in the <code>lite-harness</code> repository under <code>docs/research/</code>.
+  </footer>
+
+</div>
+</body>
+</html>
