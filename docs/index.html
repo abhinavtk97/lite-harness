@@ -226,7 +226,7 @@
   <div class="status-banner">
     <div class="dot"></div>
     <div>
-      <strong>Status: research phase.</strong> No architecture decisions have been made yet. This page presents the problem statement, the requirements as understood so far, and the full landscape survey. Open questions that still need answers before the design phase starts are listed at the bottom.
+      <strong>Status: architecture defined.</strong> The four foundational decisions and the detailed system design are now live on a dedicated page — see <a href="architecture/index.html">Architecture &rarr;</a>. This page remains the research record: the problem statement, requirements, and full landscape survey that the architecture was built from.
     </div>
   </div>
 
@@ -380,25 +380,29 @@
   <section>
     <h2>Decisions made so far</h2>
     <div class="card">
-      <p class="dim">None yet. The team has completed the research phase and agreed on the design principles above as inputs. No decisions have been made on language/runtime, deployment model, multi-agent scope, or provider strategy — see open questions below.</p>
+      <p>Four foundational decisions have been made, and a full detailed architecture built from them — see the <a href="architecture/index.html">Architecture page</a> for the complete design (component diagram, event/session data model, permission engine, cost ledger, sandboxing, Cargo workspace layout, build phasing).</p>
+      <ul>
+        <li><strong>Core identity</strong>: <code>lite-harness</code> is both its own native coding agent (own LLM loop, own tools, own sandboxing) <em>and</em> a meta-harness that can delegate subtasks to other agents via ACP — not a pure orchestrator.</li>
+        <li><strong>Language/runtime</strong>: Rust for the core engine.</li>
+        <li><strong>Deployment model (v1)</strong>: local-first — runs entirely on the user's machine; a remote/cloud execution plane is a future pluggable concern.</li>
+        <li><strong>v1 delegated-agent set</strong>: just one external agent to start (Claude Code, via the existing <code>claude-agent-acp</code> adapter — no new ACP adapters are being built), to prove the architecture end-to-end before generalizing to Codex/Gemini CLI/Goose/OpenCode.</li>
+      </ul>
     </div>
   </section>
 
   <section>
-    <h2>Open questions before the design phase starts</h2>
+    <h2>Remaining open questions</h2>
     <div class="card">
       <ul>
-        <li>Target primary language/runtime for the core engine (TypeScript/Node, Python, Rust, Go)?</li>
-        <li>Local-first vs. cloud-hosted-first vs. both from day one?</li>
-        <li>Single-agent to start, or multi-agent (supervisor/subagent) as a v1 requirement?</li>
-        <li>Which model providers must be supported at launch — Anthropic-only, or provider-agnostic BYO-key from day one?</li>
-        <li>Which 1–2 differentiator candidates should <code>lite-harness</code> actually lead with?</li>
+        <li>Which model providers must be supported at launch for the native agent loop — Anthropic-only, or provider-agnostic BYO-key from day one?</li>
+        <li>Whether to swap the build-phasing order flagged as a judgment call on the <a href="architecture/index.html#phasing">Architecture page</a> (proving the ACP vertical slice early vs. maturing the native agent first).</li>
+        <li>Windows support timeline (out of scope for v1 per the current sandboxing design).</li>
       </ul>
     </div>
   </section>
 
   <footer>
-    Research current as of August 2026. Full citations and sources are in the linked documents. This page and the underlying research live in the <code>lite-harness</code> repository under <code>docs/research/</code>.
+    Research current as of August 2026. Full citations and sources are in the linked documents. This page and the underlying research live in the <code>lite-harness</code> repository under <code>docs/research/</code>; the system design lives under <code>docs/architecture/</code>.
   </footer>
 
 </div>

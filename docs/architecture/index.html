@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lite-harness — Architecture</title>
+<meta name="description" content="Detailed system architecture for lite-harness: a native coding agent that is also a meta-harness, delegating to other agents via ACP behind one unified permission model and cost ledger.">
+<style>
+  :root {
+    --bg: #f7f7f5;
+    --bg-elevated: #ffffff;
+    --text: #1c1c1a;
+    --text-dim: #55554f;
+    --border: #dedad2;
+    --accent: #9a5b32;
+    --accent-bg: #f3e6da;
+    --code-bg: #efece4;
+    --tag-open: #8a6d1a;
+    --tag-open-bg: #faf1d6;
+    --tag-active: #2f6b46;
+    --tag-active-bg: #e3f1e7;
+    --tag-gone: #a13f3f;
+    --tag-gone-bg: #f8e6e6;
+    --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #171613;
+      --bg-elevated: #201f1b;
+      --text: #ece8df;
+      --text-dim: #b3ada0;
+      --border: #37342c;
+      --accent: #e0a172;
+      --accent-bg: #332419;
+      --code-bg: #262420;
+      --tag-open: #e0c25f;
+      --tag-open-bg: #332c14;
+      --tag-active: #7cc79a;
+      --tag-active-bg: #16301f;
+      --tag-gone: #e08a8a;
+      --tag-gone-bg: #33191a;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #171613;
+    --bg-elevated: #201f1b;
+    --text: #ece8df;
+    --text-dim: #b3ada0;
+    --border: #37342c;
+    --accent: #e0a172;
+    --accent-bg: #332419;
+    --code-bg: #262420;
+    --tag-open: #e0c25f;
+    --tag-open-bg: #332c14;
+    --tag-active: #7cc79a;
+    --tag-active-bg: #16301f;
+    --tag-gone: #e08a8a;
+    --tag-gone-bg: #33191a;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 3rem 1.5rem 6rem; }
+
+  header.hero { margin-bottom: 2.5rem; }
+  .eyebrow {
+    display: inline-block;
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: var(--accent-bg);
+    padding: 0.25rem 0.6rem;
+    border-radius: 999px;
+    font-weight: 600;
+    margin-bottom: 1rem;
+  }
+  .back-link {
+    display: inline-block;
+    margin-bottom: 1rem;
+    font-size: 0.9rem;
+    color: var(--text-dim);
+    text-decoration: none;
+  }
+  .back-link:hover { color: var(--accent); }
+  h1 {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    margin: 0 0 0.75rem;
+    letter-spacing: -0.01em;
+  }
+  .subtitle { color: var(--text-dim); font-size: 1.1rem; max-width: 65ch; }
+
+  h2 {
+    font-size: 1.4rem;
+    margin: 3rem 0 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h2 .num { color: var(--accent); margin-right: 0.4rem; }
+  h3 { font-size: 1.05rem; margin: 1.75rem 0 0.5rem; }
+  p { color: var(--text); }
+  p.dim, li.dim { color: var(--text-dim); }
+
+  .card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+    box-shadow: var(--shadow);
+    margin-bottom: 1rem;
+  }
+
+  .status-banner {
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+    background: var(--tag-active-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 2rem;
+  }
+  .status-banner .dot {
+    flex-shrink: 0;
+    width: 0.6rem; height: 0.6rem;
+    border-radius: 50%;
+    background: var(--tag-active);
+    margin-top: 0.5rem;
+  }
+  .status-banner strong { color: var(--tag-active); }
+
+  ul, ol { padding-left: 1.3rem; }
+  li { margin-bottom: 0.5rem; }
+
+  code {
+    background: var(--code-bg);
+    padding: 0.1rem 0.4rem;
+    border-radius: 5px;
+    font-size: 0.88em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem 1.2rem;
+    overflow-x: auto;
+    font-size: 0.82rem;
+    line-height: 1.55;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    box-shadow: var(--shadow);
+  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  pre.diagram { font-size: 0.72rem; line-height: 1.35; }
+
+  .decisions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 0.9rem;
+    margin: 1rem 0 2rem;
+  }
+  .decision-card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1rem 1.2rem;
+    box-shadow: var(--shadow);
+  }
+  .decision-card .label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+  }
+  .decision-card .value { font-weight: 600; margin-bottom: 0.25rem; }
+  .decision-card .detail { font-size: 0.85rem; color: var(--text-dim); }
+
+  .toc {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 0.6rem;
+    margin: 1.5rem 0;
+  }
+  .toc a {
+    display: block;
+    text-decoration: none;
+    color: inherit;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.7rem 1rem;
+    font-size: 0.9rem;
+    transition: border-color 0.12s ease;
+  }
+  .toc a:hover { border-color: var(--accent); }
+  .toc .n { color: var(--accent); font-weight: 700; margin-right: 0.4rem; }
+
+  .judgment {
+    border-left: 3px solid var(--tag-open);
+    background: var(--tag-open-bg);
+    border-radius: 0 10px 10px 0;
+    padding: 0.8rem 1.1rem;
+    margin: 1rem 0;
+    font-size: 0.92rem;
+  }
+  .judgment strong { color: var(--tag-open); }
+
+  .phase-list { list-style: none; padding: 0; counter-reset: ph; }
+  .phase-list li {
+    counter-increment: ph;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.9rem 1.1rem 0.9rem 3.2rem;
+    margin-bottom: 0.7rem;
+    position: relative;
+  }
+  .phase-list li::before {
+    content: counter(ph);
+    position: absolute;
+    left: 1rem; top: 0.85rem;
+    font-weight: 700;
+    color: var(--accent);
+    font-size: 0.9rem;
+    background: var(--accent-bg);
+    width: 1.6rem; height: 1.6rem;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  a { color: var(--accent); }
+
+  footer {
+    margin-top: 4rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <a class="back-link" href="../index.html">&larr; back to research overview</a>
+
+  <header class="hero">
+    <span class="eyebrow">lite-harness · architecture</span>
+    <h1>Detailed system architecture</h1>
+    <p class="subtitle">A native coding agent that is also a meta-harness — it can delegate subtasks to other agents (Claude Code, and later Codex/Gemini CLI/Goose/OpenCode) via the Agent Client Protocol, with one unified permission model and one legible cost ledger across all of it.</p>
+  </header>
+
+  <div class="status-banner">
+    <div class="dot"></div>
+    <div>
+      <strong>Status: architecture defined, no code written yet.</strong> Four foundational decisions are locked in below. This document is the detailed design that follows from them and from the design principles established during the research phase.
+    </div>
+  </div>
+
+  <section>
+    <h2>Context</h2>
+    <p>The <a href="../index.html">prior research</a> surveyed 20+ existing AI coding-agent harnesses and concluded the real differentiator for <code>lite-harness</code> isn't the mechanics of spawning other agents as subprocesses — several scrappy 2026 open-source projects already do that. The differentiator is <strong>a genuinely unified permission model and a single legible cost ledger across heterogeneous underlying agents</strong>. The Agent Client Protocol (ACP) — <a href="../research/raw/acp-and-meta-harness.md">verified hands-on</a> by cloning and running real ACP code, not just reading docs — is a good <em>transport</em> for reaching those agents but gives zero orchestration primitives of its own.</p>
+    <p>One crucial scope simplification drives this design: <strong>no new ACP adapters need to be built</strong> — <code>lite-harness</code> only needs to be a correct ACP <em>client</em> against agents that already speak ACP, natively or via existing, mature third-party adapters like <code>claude-agent-acp</code> and <code>codex-acp</code>.</p>
+
+    <div class="decisions-grid">
+      <div class="decision-card">
+        <div class="label">Core identity</div>
+        <div class="value">Orchestrator + own native agent</div>
+        <div class="detail">Own LLM loop, own tools, own sandboxing — <em>and</em> can delegate to other agents via ACP. Not a pure orchestrator.</div>
+      </div>
+      <div class="decision-card">
+        <div class="label">Language / runtime</div>
+        <div class="value">Rust</div>
+        <div class="detail">Same language as the official ACP SDK and as Zed itself; strong fit for a process-supervisor daemon.</div>
+      </div>
+      <div class="decision-card">
+        <div class="label">Deployment model (v1)</div>
+        <div class="value">Local-first</div>
+        <div class="detail">Runs entirely on the user's machine. Remote/cloud execution plane is a future pluggable concern.</div>
+      </div>
+      <div class="decision-card">
+        <div class="label">v1 delegated-agent set</div>
+        <div class="value">One agent: Claude Code</div>
+        <div class="detail">Via <code>claude-agent-acp</code>. Prove the architecture end-to-end before generalizing to Codex, Gemini CLI, Goose, OpenCode.</div>
+      </div>
+    </div>
+
+    <p class="dim">This design reflects ten principles from the research phase: event-log-as-substrate, a UI-agnostic core, decoupled reasoning/execution planes, pluggable session storage, permission enforcement inside the core (not the UI), structural gates on destructive actions, typed multi-agent control flow, built-in cost/observability, ACI-style tool design, and MCP governed through the same boundary as everything else.</p>
+  </section>
+
+  <nav class="toc">
+    <a href="#diagram"><span class="n">1</span>Component diagram</a>
+    <a href="#process"><span class="n">2</span>Process model</a>
+    <a href="#data-model"><span class="n">3</span>Event/session data model</a>
+    <a href="#protocol"><span class="n">4</span>The Harness Protocol</a>
+    <a href="#acp"><span class="n">5</span>ACP orchestration module</a>
+    <a href="#permission"><span class="n">6</span>Permission engine</a>
+    <a href="#ledger"><span class="n">7</span>Cost ledger</a>
+    <a href="#sandbox"><span class="n">8</span>Sandbox / execution plane</a>
+    <a href="#subagents"><span class="n">9</span>Native subagents</a>
+    <a href="#workspace"><span class="n">10</span>Cargo workspace layout</a>
+    <a href="#phasing"><span class="n">11</span>Build order / phasing</a>
+  </nav>
+
+  <section id="diagram">
+    <h2><span class="num">1</span>High-level component diagram</h2>
+    <pre class="diagram"><code>                              ┌───────────────────────────────────────────────────┐
+                              │                lite-harness-core (daemon)          │
+                              │                                                     │
+                              │   ┌─────────────┐     ┌────────────────────────┐   │
+  ┌──────────────┐  Harness   │   │  Native      │     │  ACP Orchestration     │   │
+  │   CLI (tty)  │◄──Protocol─┼──►│  Agent Loop  │     │  Module                │   │
+  └──────────────┘  (local    │   │  (LLM +      │     │  (spawns/owns N        │   │
+                     UDS/     │   │  tool exec)  │     │  claude-agent-acp /    │   │
+  ┌──────────────┐  named     │   └──────┬───────┘     │  codex-acp / … procs)  │   │
+  │  Web UI       │  pipe)    │          │             └──────────┬─────────────┘   │
+  │ (browser) ───►│───────────┼──►┌──────▼─────────────────────────▼─────────────┐  │
+  └──────────────┘  (via      │   │         Permission Engine (ONE gate)         │  │
+                     local     │   │  intercepts: native tool_call requests  AND │  │
+  ┌──────────────┐  web        │   │  ACP session/request_permission calls       │  │
+  │ Headless /    │  backend   │   └──────┬───────────────────────────────────┬──┘  │
+  │ SDK / CI      │  process)  │          │                                   │     │
+  └──────────────┘◄───────────┼──►┌───────▼────────┐                 ┌────────▼───┐ │
+                              │   │  Sandbox /      │                 │  Cost       │ │
+                              │   │  ExecutionPlane │                 │  Ledger     │ │
+                              │   │  (Landlock/     │                 │  (usage     │ │
+                              │   │  Seatbelt/local │                 │  events →   │ │
+                              │   │  proc exec)     │                 │  rollups)   │ │
+                              │   └────────┬────────┘                 └──────┬─────┘ │
+                              │            │                                 │       │
+                              │   ┌────────▼─────────────────────────────────▼────┐  │
+                              │   │        Event Log / Session Store               │  │
+                              │   │  append-only log per session, SQLite behind    │  │
+                              │   │  a `SessionStore` trait                        │  │
+                              │   └─────────────────────────────────────────────────┘ │
+                              └───────────────────────────────────────────────────────┘
+                                              │                        │
+                                     spawns, stdio JSON-RPC   spawns, stdio JSON-RPC
+                                              │                        │
+                                   ┌──────────▼─────────┐   ┌──────────▼─────────┐
+                                   │ claude-agent-acp    │   │ codex-acp (later)  │
+                                   │ (wraps Claude Code) │   │ (wraps Codex CLI)  │
+                                   └─────────────────────┘   └────────────────────┘</code></pre>
+    <p><strong>Key invariant</strong>: CLI, Web UI, and headless clients never talk to the native agent loop, ACP module, permission engine, sandbox, or cost ledger directly — only to the daemon over the Harness Protocol (§4). The web UI's backend is itself just another Harness Protocol client with zero agent-loop logic, so it can be killed/restarted without affecting in-flight sessions.</p>
+  </section>
+
+  <section id="process">
+    <h2><span class="num">2</span>Process model: a local daemon, not an embedded library</h2>
+    <p><strong>Decision: a long-running local daemon (<code>lite-harnessd</code>)</strong>, with the CLI and the web backend as thin IPC clients that spawn-or-attach to it.</p>
+    <p>Why not an embedded library linked into each UI: closing the CLI terminal would then kill in-flight native tool execution, kill ACP subprocess connections (their stdio pipes die with the parent), and drop pending permission prompts — exactly the "UI is load-bearing" failure this project exists to avoid. A daemon also lets ACP connections (expensive to re-establish: subprocess spawn + <code>initialize</code> + <code>session/new</code> handshake) stay warm across multiple CLI invocations and a web UI reconnect, and gives one single writer for the event log instead of needing cross-process lock/merge semantics.</p>
+    <div class="card">
+      <ul>
+        <li>Single Tokio async process. First CLI/web invocation auto-spawns the daemon if none is running for the current workspace (same self-bootstrap pattern as <code>rust-analyzer</code>/<code>sccache</code>).</li>
+        <li>Transport: <strong>Unix domain socket</strong> at <code>$XDG_RUNTIME_DIR/lite-harness/&lt;workspace-hash&gt;.sock</code>. One daemon <strong>per workspace root</strong> (detected via <code>.git</code> or <code>--workspace</code>), not global — keeps sandbox policy and permission scoping project-local, matching the layered policy model in §6.</li>
+        <li>The daemon has <strong>no direct terminal/UI I/O</strong> — only structured diagnostic logs to a file. Physically enforces "core has no UI dependency" rather than relying on convention.</li>
+        <li>Idle daemons self-terminate after a configurable timeout (default 30 min) with zero active sessions/clients, but stay warm across a rapid sequence of CLI calls.</li>
+        <li>Crash recovery: the event log is durable (fsynced), so a daemon restart reconstructs session state by replay; only in-flight ACP connections and native tool executions are lost and get marked <code>interrupted</code> on next open.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="data-model">
+    <h2><span class="num">3</span>Unified event/session data model</h2>
+    <p>Everything that happens — a native LLM turn, a native tool call, a delegated ACP agent's message chunk, a permission decision, a cost report, a subagent spawning — is one <code>Event</code> appended to a per-session log.</p>
+    <pre><code>#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Event {
+    pub seq: u64,                          // monotonic within a session
+    pub event_id: EventId,                 // ULID/UUIDv7
+    pub session_id: SessionId,
+    pub parent_session_id: Option&lt;SessionId&gt;,  // None for root; Some for any subagent/delegated child
+    pub ts: DateTime&lt;Utc&gt;,
+    pub actor: Actor,
+    pub payload: EventPayload,
+}
+
+pub enum Actor {
+    User,
+    NativeAgent,
+    NativeSubagent { child_session: SessionId },
+    DelegatedAgent { child_session: SessionId, agent_kind: AgentKind },
+    System,
+}
+
+pub enum EventPayload {
+    UserMessage { content: Vec&lt;ContentBlock&gt; },
+    AgentMessageChunk { content: ContentBlock },
+    AgentThoughtChunk { content: ContentBlock },
+    ToolCallRequested { call: ToolCall },
+    ToolCallUpdated { call_id: ToolCallId, status: ToolCallStatus, output: Option&lt;ContentBlock&gt; },
+    PermissionRequested { call_id: ToolCallId, request: PermissionRequest },
+    PermissionDecided { call_id: ToolCallId, decision: PermissionDecision, decided_by: DecisionSource },
+    UsageReported { usage: UsageDelta },
+    ChildSessionSpawned { child: SessionId, kind: ChildKind, spec: ChildSpec },
+    ChildSessionEnded { child: SessionId, outcome: ChildOutcome },
+    SessionForked { from_seq: u64, new_session: SessionId },
+    SessionResumed { at_seq: u64 },
+    PlanUpdated { steps: Vec&lt;PlanStep&gt; },
+    Error { message: String, recoverable: bool },
+}
+
+pub struct ToolCall {
+    pub call_id: ToolCallId,
+    pub tool_name: String,
+    pub source: ToolSource,   // Native(BuiltinToolId) | Mcp(server, tool) | Acp(agent_kind)
+    pub args_summary: serde_json::Value,
+    pub raw_args: serde_json::Value,
+}</code></pre>
+    <p><strong>Design intent</strong>: <code>ToolCall.source: ToolSource</code> is what unifies native, MCP-originated, and ACP-delegated tool calls under one shape — the permission engine and every UI key off <code>ToolSource</code>, never off "which subsystem produced this." ACP's <code>session/update</code> variants map close to 1:1 onto <code>EventPayload</code> variants by design: the ACP orchestration module is a <em>translator</em>, not a special case. Adding delegated-agent #2/#3 should never require a new <code>EventPayload</code> variant.</p>
+
+    <h3>Session tree</h3>
+    <p>A <strong>root session</strong> is created per top-level conversation. A <strong>native subagent</strong> creates a child session (<code>parent_session_id</code> set), its own event sub-stream, and a permission scope that can only be a <em>restriction</em> of the parent's. A <strong>delegated ACP agent</strong> creates a child session identical in shape, differing only in <code>ChildKind::Delegated(AgentKind::ClaudeCode)</code> vs. <code>ChildKind::NativeSubagent</code>. One recursive tree results; a delegated ACP agent is a leaf from our side (ACP is 1:1), while a native subagent can itself spawn further children.</p>
+
+    <h3>Storage</h3>
+    <p>Interface-first, per design principle 4 — never a concrete DB call sprinkled through the codebase:</p>
+    <pre><code>#[async_trait]
+pub trait SessionStore: Send + Sync {
+    async fn append(&amp;self, event: Event) -&gt; Result&lt;()&gt;;
+    async fn read_from(&amp;self, session_id: SessionId, from_seq: u64) -&gt; Result&lt;EventStream&gt;;
+    async fn subscribe(&amp;self, session_id: SessionId) -&gt; Result&lt;BoxStream&lt;'static, Event&gt;&gt;;
+    async fn session_tree(&amp;self, root: SessionId) -&gt; Result&lt;SessionTree&gt;;
+    async fn latest_seq(&amp;self, session_id: SessionId) -&gt; Result&lt;u64&gt;;
+}</code></pre>
+    <p>v1 implementation: SQLite (<code>rusqlite</code>, WAL mode) — one row per event, indexed by <code>session_id</code>+<code>seq</code>, JSON payload column. Behind the trait, a future <code>PostgresSessionStore</code> can be added for a hosted deployment without touching the agent loop, ACP module, or protocol layer — avoiding the exact mistake that forced OpenAI to deprecate the Assistants API (fusing protocol to state ownership).</p>
+    <p><strong>Resume</strong>: reopen by <code>session_id</code>, catch a client up via <code>read_from(last_acked_seq)</code>. For a resumed delegated child, the ACP module attempts ACP's <code>session/load</code> if declared; otherwise starts fresh but stays attached to the same tree node, recording the degraded resume explicitly.</p>
+    <p><strong>Fork</strong>: copy-on-branch — a new <code>session_id</code> with a <code>forked_from</code> pointer; <code>read_from</code> transparently stitches the parent prefix + child suffix rather than physically copying events. Forking a session with an active delegated-agent child does not attempt to fork the underlying ACP agent's own state; it starts a fresh ACP session for the forked branch and records the discontinuity.</p>
+  </section>
+
+  <section id="protocol">
+    <h2><span class="num">4</span>The Harness Protocol</h2>
+    <p>A stable, versioned, local-first RPC protocol between <code>lite-harnessd</code> and its own clients (CLI, web backend, headless/SDK) — <strong>distinct from ACP</strong>, which is what the daemon speaks <em>outbound</em> to delegated agents.</p>
+    <div class="card">
+      <ul>
+        <li><strong>Transport</strong>: JSON-RPC 2.0 over the same UDS, newline-delimited framing — deliberately matching ACP's own message shape so the team needs only one JSON-RPC plumbing implementation for both directions.</li>
+        <li><strong>Versioning</strong>: an <code>initialize</code> handshake negotiates protocol version + capability flags; method names stay stable across minor versions.</li>
+        <li><strong>Requests</strong> (client→daemon): <code>session/create</code>, <code>session/prompt</code>, <code>session/fork</code>, <code>session/resume</code>, <code>session/cancel</code>, <code>permission/respond</code>, <code>ledger/query</code>, <code>session/tree</code>, <code>agents/list</code>.</li>
+        <li><strong>Notifications</strong> (daemon→client, streamed): <code>event</code> — literally the same <code>Event</code> struct from §3. No parallel "UI event" schema that could drift from ground truth.</li>
+        <li>Even UI-driven approval flows go through the append-only path: <code>permission/respond</code> is a request whose effect is to append a <code>PermissionDecided</code> event — never a side channel that could bypass it.</li>
+        <li><strong>Headless/CI</strong>: <code>lite-harness run --json &lt;prompt&gt;</code> does <code>session/create</code> + <code>session/prompt</code> + drains <code>event</code> notifications to stdout as NDJSON. This <em>is</em> the headless interface, not a separate implementation.</li>
+        <li><strong>Web UI</strong>: <code>lh-web-backend</code> holds one Harness Protocol UDS connection and re-exposes it as a websocket to the browser, translating framing only, never interpreting event semantics.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="acp">
+    <h2><span class="num">5</span>ACP orchestration module</h2>
+    <h3>Spawning and holding a connection</h3>
+    <p>Uses the official <code>agent-client-protocol</code> Rust crate (the same crate that powers the Zed editor). <code>lite-harness</code> implements the crate's <code>Client</code> trait; <code>claude-agent-acp</code> implements <code>Agent</code>.</p>
+    <pre><code>struct AcpConnection {
+    child: tokio::process::Child,
+    conn: acp::ClientSideConnection,
+    agent_kind: AgentKind,
+    acp_session_id: acp::SessionId,      // ACP's own session id
+    our_session_id: SessionId,           // our tree's child SessionId
+}
+
+#[async_trait]
+impl acp::Client for HarnessAcpClient {
+    async fn session_update(&amp;self, params: acp::SessionUpdateParams) -&gt; Result&lt;()&gt; {
+        let event = translate_acp_update(self.our_session_id, params);  // pure mapping, §3
+        self.store.append(event).await
+    }
+
+    async fn request_permission(
+        &amp;self,
+        params: acp::RequestPermissionParams,
+    ) -&gt; Result&lt;acp::RequestPermissionResponse&gt; {
+        // Same PermissionEngine that gates native tool calls — not a parallel path.
+        let req = translate_acp_permission_request(self.our_session_id, &amp;params);
+        self.store.append(Event::permission_requested(self.our_session_id, req.clone())).await?;
+        let decision = self.permission_engine.decide(&amp;req).await?;
+        self.store.append(Event::permission_decided(self.our_session_id, decision.clone())).await?;
+        Ok(translate_decision_to_acp_response(decision, &amp;params))
+    }
+
+    async fn read_text_file(&amp;self, params: acp::ReadTextFileParams) -&gt; Result&lt;...&gt; { /* via sandboxed FS, §8 */ }
+    async fn write_text_file(&amp;self, params: acp::WriteTextFileParams) -&gt; Result&lt;...&gt; { /* gated the same way */ }
+}</code></pre>
+    <p>Flow for delegating one task to Claude Code: look up <code>AgentKind::ClaudeCode</code> in the agent registry → spawn <code>claude-agent-acp</code> with piped stdio → ACP <code>initialize</code> → <code>session/new</code> → append <code>ChildSessionSpawned</code>, mint our own <code>SessionId</code>, record the id mapping → <code>session/prompt</code> → all further traffic is inbound <code>session/update</code>/<code>request_permission</code> handled by <code>HarnessAcpClient</code> → on completion append <code>ChildSessionEnded</code> and, if reported, a final <code>UsageReported</code>. <code>session/cancel</code> on the Harness Protocol cascades into an ACP <code>session/cancel</code> before subprocess teardown.</p>
+
+    <h3>Adding delegated agent #2, #3, ... without touching the core</h3>
+    <p>The core orchestration module never changes when adding Codex/Gemini/Goose/OpenCode. What's added is one small, declarative adapter value:</p>
+    <pre><code>pub struct DelegatedAgentAdapter {
+    pub kind: AgentKind,
+    pub spawn: SpawnSpec,                 // binary/path, args, env, cwd rule
+    pub capabilities: AcpCapabilities,     // session/load? plan updates? usage reporting?
+    pub usage_mapping: UsageMappingHint,   // how (if at all) this agent reports usage
+    pub health_check: HealthCheck,
+}</code></pre>
+    <p>Registered in a config file the daemon loads at startup (not a recompile), and exposed read-only over the Harness Protocol (<code>agents/list</code>) so UIs can present a "delegate to: [...]" picker without hardcoding the list.</p>
+    <div class="judgment"><strong>Needs a quick check before implementation</strong>: how <code>claude-agent-acp</code> sources credentials (its own OAuth vs. passing through <code>ANTHROPIC_API_KEY</code> vs. shelling out to an already-logged-in <code>claude</code> CLI). v1 assumes it's pre-installed/discoverable on <code>PATH</code> or via a configured path — auto-install is out of scope for the first vertical slice.</div>
+  </section>
+
+  <section id="permission">
+    <h2><span class="num">6</span>Permission engine — the core differentiator</h2>
+    <h3>Policy model</h3>
+    <pre><code>pub struct PermissionRequest {
+    pub session_id: SessionId,
+    pub tool_source: ToolSource,           // Native | Mcp | Acp(agent_kind)
+    pub action: PermissionAction,          // structured, not a free string
+    pub risk_tier: RiskTier,               // Read | Write | Execute | Network | Destructive
+}
+
+pub enum PermissionAction {
+    FileRead { path: PathBuf },
+    FileWrite { path: PathBuf, diff_summary: Option&lt;String&gt; },
+    Exec { command: String, args: Vec&lt;String&gt;, cwd: PathBuf },
+    NetworkFetch { url: String },
+    McpToolCall { server: String, tool: String, args_summary: serde_json::Value },
+    DelegatedAgentToolCall { agent: AgentKind, acp_tool_call: ToolCall },
+}
+
+pub enum PermissionDecision { Allow, AllowAlways(PolicyScope), Deny, DenyAlways(PolicyScope) }
+pub enum PolicyScope { Session, Project, Global }</code></pre>
+    <p>Rule resolution: session-scoped &gt; project-scoped (<code>.lite-harness/policy.toml</code>) &gt; global-scoped (<code>~/.config/lite-harness/policy.toml</code>) &gt; built-in default (read auto-allowed; write/execute/network/destructive default to <code>Ask</code>).</p>
+
+    <h3>One interception point — structurally, not by convention</h3>
+    <pre><code>#[async_trait]
+pub trait PermissionEngine: Send + Sync {
+    /// Called by (a) the native tool executor before ANY tool, built-in or
+    /// MCP-sourced, and (b) HarnessAcpClient::request_permission for ANY
+    /// delegated agent's tool call. No other path exists.
+    async fn decide(&amp;self, req: &amp;PermissionRequest) -&gt; Result&lt;PermissionDecision&gt;;
+}</code></pre>
+    <p>The bypass class that recurs across every competitor studied (Cline #9357, Codex #34515, Amazon Q #2510 — UI checkbox state silently not enforced by the actual execution path) is closed at the type level, not by discipline:</p>
+    <pre><code>pub trait ExecutionPlane {
+    // The mandatory `proof` argument means there is no code path from a
+    // ToolCall to actual execution that skips a PermissionDecision — it's
+    // a compile error, not a runtime risk.
+    async fn execute(&amp;self, call: &amp;ToolCall, proof: &amp;PermissionDecision) -&gt; Result&lt;ToolCallOutput&gt;;
+}</code></pre>
+    <p><code>AllowAlways</code>/<code>DenyAlways</code> persist into the policy store at the chosen scope. MCP-originated calls get identical treatment — no "MCP is trusted" shortcut anywhere.</p>
+
+    <h3>Structural gate on destructive actions</h3>
+    <p>Two mechanisms, not just a scarier prompt: (1) <code>RiskTier::Destructive</code> requests can <strong>never</strong> be satisfied by a blanket <code>AllowAlways</code> rule — the engine hard-codes a check that forces interactive <code>Ask</code> for that specific call regardless of session-level "allow everything" settings; (2) the <code>ExecutionPlane</code>'s OS-level sandbox (§8) is a backstop in case the heuristic risk classifier misses something. This is the direct answer to the Replit/Cursor-style incidents in the prior research.</p>
+  </section>
+
+  <section id="ledger">
+    <h2><span class="num">7</span>Cost ledger</h2>
+    <p>Captured as <code>UsageReported</code> events, never a separately-mutated counter — the ledger is a derived read-model over the event log.</p>
+    <pre><code>pub struct UsageDelta {
+    pub input_tokens: Option&lt;u64&gt;,
+    pub output_tokens: Option&lt;u64&gt;,
+    pub cost_usd: Option&lt;Decimal&gt;,
+    pub wall_ms: u64,
+    pub confidence: UsageConfidence,   // Exact | Estimated | Unknown
+}</code></pre>
+    <p>Native LLM calls: computed from the provider's usage block + a pluggable <code>ModelPricing</code> table. Delegated ACP agents: mapped via each adapter's declared <code>UsageMappingHint</code>; when an agent reports nothing, the ledger still records that a turn happened (count, duration, which agent) rather than silently omitting the line — an honest gap, not a fabricated number.</p>
+    <p>Aggregation: <code>CostLedger::rollup(session_id)</code> folds <code>UsageReported</code> events recursively across the whole session tree, with <code>None</code>-propagation so a subtree containing any <code>Unknown</code> turns is flagged partial. Exposed as a literal tree — <em>"root: $0.42 = $0.31 native + $0.11 delegated(Claude Code), 1 turn cost-unknown"</em> — not just a flat number. This is the "single legible cost ledger across heterogeneous agents" differentiator made concrete.</p>
+  </section>
+
+  <section id="sandbox">
+    <h2><span class="num">8</span>Sandbox / execution plane</h2>
+    <pre><code>#[async_trait]
+pub trait ExecutionPlane: Send + Sync {
+    async fn execute(&amp;self, call: &amp;ToolCall, proof: &amp;PermissionDecision) -&gt; Result&lt;ToolCallOutput&gt;;
+    async fn read_file(&amp;self, path: &amp;Path, proof: &amp;PermissionDecision) -&gt; Result&lt;Vec&lt;u8&gt;&gt;;
+    async fn write_file(&amp;self, path: &amp;Path, contents: &amp;[u8], proof: &amp;PermissionDecision) -&gt; Result&lt;()&gt;;
+    fn describe(&amp;self) -&gt; ExecutionPlaneCapabilities;
+}</code></pre>
+    <div class="card">
+      <p><strong>v1 <code>LocalExecutionPlane</code>:</strong></p>
+      <ul>
+        <li><strong>Linux</strong>: <code>landlock</code> crate (kernel 5.13+) restricts filesystem access to the workspace root + scratch dir at the kernel level. Network-restriction Landlock rules need kernel 6.7+; probe at startup and fall back to a namespace/<code>bubblewrap</code>-based approach on older kernels.</li>
+        <li><strong>macOS</strong>: shell out to <code>/usr/bin/sandbox-exec</code> with a generated <code>.sb</code> profile (no well-maintained Rust crate for Seatbelt exists).</li>
+        <li>Process execution via <code>tokio::process::Command</code>, <code>cwd</code> pinned to the workspace root, environment scrubbed to an explicit allowlist, wall-clock timeout and output byte cap enforced regardless of OS sandbox support.</li>
+        <li><strong>Windows</strong>: out of scope for v1; runs without a hard OS sandbox and forces <code>Ask</code> on every write/execute request rather than pretending to be sandboxed.</li>
+      </ul>
+    </div>
+    <p>This trait is why a future remote/container execution plane can slot in without touching the permission engine, event schema, or ACP module: every caller depends only on <code>ExecutionPlane</code>, injected once at daemon startup from config.</p>
+  </section>
+
+  <section id="subagents">
+    <h2><span class="num">9</span>Native subagents — same machinery as delegated agents</h2>
+    <p>The native agent loop's own subagent spawning reuses the exact same session-tree, permission, and cost machinery as a delegated ACP agent — only <code>ChildKind</code> and the driving mechanism (in-process task vs. ACP round-trip to a subprocess) differ.</p>
+    <pre><code>pub struct NativeSubagentSpec {
+    pub role: String,
+    pub system_prompt_override: Option&lt;String&gt;,
+    pub tool_allowlist: Vec&lt;ToolId&gt;,      // must be a subset of the parent's
+    pub permission_scope: PolicyScope,     // typically session-scoped, stricter than parent
+    pub max_turns: Option&lt;u32&gt;,
+}</code></pre>
+    <p>Isolation is enforced at two levels: conversation/context (each child gets an explicit <code>TaskHandoff</code>, never the parent's full transcript) and policy (<code>tool_allowlist</code>/<code>permission_scope</code> can only narrow relative to the parent). The supervisor decides "native subagent or delegated ACP agent?" through one shared trait — typed control flow, not free-form multi-agent conversation (the failure mode that pushed Microsoft to retire AutoGen's conversational orchestration):</p>
+    <pre><code>#[async_trait]
+pub trait ChildRunner: Send + Sync {
+    async fn run(&amp;self, parent: SessionId, task: TaskHandoff) -&gt; Result&lt;ChildOutcome&gt;;
+}
+// impls: NativeSubagentRunner, AcpDelegatedRunner</code></pre>
+  </section>
+
+  <section id="workspace">
+    <h2><span class="num">10</span>Cargo workspace layout</h2>
+    <pre><code>lite-harness/
+├── Cargo.toml
+├── crates/
+│   ├── lh-event            # Event/EventPayload/ToolCall/session-tree types — near-zero deps
+│   ├── lh-store             # SessionStore trait + SqliteSessionStore impl
+│   ├── lh-permission         # PermissionEngine trait, DefaultPermissionEngine, policy model
+│   ├── lh-execution           # ExecutionPlane trait, LocalExecutionPlane (Landlock/Seatbelt)
+│   ├── lh-ledger               # CostLedger rollup logic, UsageDelta, ModelPricing
+│   ├── lh-native-agent           # NativeAgentLoop, ChildRunner/NativeSubagentRunner, built-in tools
+│   ├── lh-mcp                     # MCP client integration for native tools — routes via lh-permission
+│   ├── lh-acp                      # HarnessAcpClient, agent registry, DelegatedAgentAdapter
+│   ├── lh-protocol                  # Harness Protocol wire types + JSON-RPC framing
+│   ├── lh-daemon                     # lite-harnessd binary — wires everything, owns UDS listener
+│   ├── lh-cli                         # lite-harness binary — thin Harness Protocol client
+│   ├── lh-web-backend                  # local web server — Harness Protocol client, websocket bridge
+│   └── lh-web-ui                        # presentation only, over lh-web-backend's API
+└── xtask/                                # dev tooling, integration harness with a fake ACP agent</code></pre>
+    <p>Dependency direction: <code>lh-event</code> underlies everything; <code>lh-store</code>, <code>lh-permission</code>, <code>lh-execution</code>, <code>lh-ledger</code> are independent siblings depending only on <code>lh-event</code>; <code>lh-native-agent</code>/<code>lh-mcp</code>/<code>lh-acp</code> depend on those plus <code>lh-event</code>; <code>lh-daemon</code> is the only crate that constructs concrete implementations and wires trait objects together; <code>lh-cli</code>/<code>lh-web-backend</code> depend <strong>only</strong> on <code>lh-protocol</code> — a compile-time enforcement of "the UI is never load-bearing."</p>
+  </section>
+
+  <section id="phasing">
+    <h2><span class="num">11</span>Build order / phasing</h2>
+    <ol class="phase-list">
+      <li><strong>Skeleton &amp; protocol plumbing</strong> — <code>lh-event</code> types, <code>SqliteSessionStore</code>, <code>lh-protocol</code> framing, a daemon that echoes a hardcoded event stream, a CLI that connects and prints events. Proves the daemon+thin-client process model with zero agent logic.</li>
+      <li><strong>Native agent loop, one real task, no sandbox yet</strong> — single LLM provider, minimal built-in tools (read/write/edit/bash, initially unsandboxed and explicitly flagged as dev-only), <code>DefaultPermissionEngine</code> in <code>Ask</code>-only mode round-tripping through the daemon to the CLI.</li>
+      <li><strong>Real sandboxing</strong> — <code>LocalExecutionPlane</code> with Landlock (Linux first), policy persistence, native cost ledger.</li>
+      <li><strong>The ACP vertical slice — the architecture's actual proof point</strong> — <code>lh-acp</code>, <code>HarnessAcpClient</code>, the Claude Code adapter, one delegated task end-to-end. The test that matters: one permission-prompt path handles both a native tool call and a Claude-Code-originated one, and the cost ledger shows one aggregated total across both. Everything after this phase is expansion, not new architecture.</li>
+      <li><strong>Native subagents</strong> — <code>ChildRunner</code>/<code>NativeSubagentRunner</code>, session-tree fork/resume. Should require touching <code>lh-permission</code>/<code>lh-ledger</code> not at all — itself a validation the abstractions were shaped correctly.</li>
+      <li><strong>Web UI</strong> — <code>lh-web-backend</code> as a pure protocol client, <code>lh-web-ui</code> as presentation only. Should be "just write a UI," not "extend the core."</li>
+      <li><strong>Expand delegated-agent set</strong> (Codex via <code>codex-acp</code>, then Gemini CLI/Goose/OpenCode natively), MCP integration, remote/container execution plane, richer policy, Windows support — additive against the traits established in phases 1-4.</li>
+    </ol>
+    <div class="judgment"><strong>Open judgment call, flagged for review</strong>: phase 4 (ACP) is placed before full native-agent polish and before native subagents, on the theory that proving cross-agent-type permission/cost unification early — while the surface area is small — reduces the riskiest unknown sooner. If the team judges native-agent maturity as the more urgent near-term risk, phases 3 and 4 can be swapped with no architectural change.</div>
+  </section>
+
+  <section>
+    <h2>Critical files to create first, in build order</h2>
+    <div class="card">
+      <ul>
+        <li><code>crates/lh-event/src/lib.rs</code> — <code>Event</code>/<code>EventPayload</code>/<code>ToolCall</code>/session-tree types (§3); everything else depends on this being right.</li>
+        <li><code>crates/lh-protocol/src/lib.rs</code> — Harness Protocol wire types + JSON-RPC framing (§4); the daemon/client contract, defined before any UI exists.</li>
+        <li><code>crates/lh-permission/src/lib.rs</code> — <code>PermissionEngine</code> trait, <code>PermissionRequest</code>/<code>PermissionDecision</code>, policy resolution (§6) — the load-bearing abstraction for the project's core differentiator.</li>
+        <li><code>crates/lh-acp/src/client.rs</code> — <code>HarnessAcpClient</code>'s <code>impl acp::Client</code>, ACP-to-<code>Event</code> translation, <code>DelegatedAgentAdapter</code>/agent registry (§5) — the other half of the differentiator, and the piece with the most external-crate integration risk.</li>
+        <li><code>crates/lh-daemon/src/main.rs</code> — wires concrete <code>SessionStore</code>/<code>PermissionEngine</code>/<code>ExecutionPlane</code>/<code>ChildRunner</code> implementations together (§2, §10) — proof the whole architecture compiles as one system.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>Verification</h2>
+    <p class="dim">This phase produces a design document, not running code, so "verification" means: the plan is internally consistent and testable against the stated requirements before any Rust is written.</p>
+    <ul>
+      <li>Cross-check §1-11 against the ten design principles from the research phase — confirm each principle maps to a concrete mechanism above, not just a restated goal. Spot checks: principle 5 → §6's <code>proof: &amp;PermissionDecision</code> argument; principle 4 → §3's <code>SessionStore</code> trait; principle 1 → §3's <code>Event</code> as the sole state-changing primitive.</li>
+      <li>Once phases 1-4 above are implemented, the concrete acceptance test for "the architecture works" is: from the CLI, run one task that triggers both a native tool call and a delegated Claude Code tool call in the same session, see both permission prompts rendered identically (differing only in the displayed <code>ToolSource</code>), and see one <code>ledger/query</code> response with a combined cost total covering both.</li>
+    </ul>
+  </section>
+
+  <footer>
+    Raw markdown source: <a href="architecture.md">architecture.md</a>. Research this design is built from: <a href="../index.html">research overview</a>, <a href="../research/agent-harness-landscape.md">landscape synthesis</a>, <a href="../research/raw/acp-and-meta-harness.md">ACP &amp; meta-harness findings</a>.
+  </footer>
+
+</div>
+</body>
+</html>
