@@ -23,6 +23,12 @@ synthesis.
 2. **IDE-integrated harnesses** — Cursor, Windsurf, Cline, Roo Code, Continue.dev, GitHub Copilot (Chat/Agent mode/Coding Agent) ([raw](raw/ide-integrated-harnesses.md))
 3. **Autonomous/cloud agents + generic orchestration frameworks** — Devin, OpenHands, SWE-agent, Google Jules, Replit Agent, GitHub Copilot coding agent, LangGraph, AutoGen/AG2, CrewAI, Claude Agent SDK, OpenAI Agents SDK, AutoGPT ([raw](raw/autonomous-agents-and-frameworks.md))
 
+A fourth, follow-up pass covers a specific candidate differentiator — see
+section 8 below: **ACP and the "meta-harness" pattern** — whether
+`lite-harness` could orchestrate *other* existing harnesses (Claude Code,
+OpenCode, Codex CLI, Gemini CLI, etc.) as subagents, and whether the Agent
+Client Protocol (ACP) could help ([raw](raw/acp-and-meta-harness.md)).
+
 This document is **not yet a design** for `lite-harness` — it's the input
 the design should be built from. See section 7 for the current decision
 status.
@@ -320,3 +326,57 @@ step is a dedicated architecture-design pass (component boundaries, wire
 protocol shape, storage interfaces, sandbox integration points) for
 `lite-harness` itself, informed by sections 5 and 6 above, once those
 open questions are answered.
+
+## 8. Candidate USP: lite-harness as a meta-harness ("harness of harnesses")
+
+Follow-up research, prompted by exploring a potential differentiator: could
+`lite-harness` spin up and orchestrate *other* existing coding-agent
+harnesses (Claude Code, OpenCode, Codex CLI, Gemini CLI, etc.) as subagents,
+rather than only spawning homogeneous subagents of itself? And specifically,
+can the Agent Client Protocol (ACP) — Zed Industries' JSON-RPC protocol for
+editor↔agent communication — help build this? Full raw findings:
+[acp-and-meta-harness.md](raw/acp-and-meta-harness.md).
+
+**Findings (Aug 2026, via two research passes):**
+
+- **ACP is a usable transport, not an orchestration layer.** It's strictly a
+  1:1 client↔agent JSON-RPC protocol (mostly stdio) with a genuinely rich
+  session model — streaming updates, `session/request_permission`,
+  cancellation, resume — good enough to replace bespoke per-tool subprocess
+  wrapping code. But the spec has **zero vocabulary for orchestration
+  itself**: no parent/child or delegation semantics, no task routing, no
+  result-merging, and per-connection permission requests that don't
+  propagate across nested agents. Cross-agent cost/token accounting was only
+  just standardized (`Session Usage` RFD) and is inconsistently implemented
+  (open bugs against Goose, Gemini CLI, codex-acp).
+- **ACP agent-side support today**: native/first-party in Gemini CLI, Goose,
+  OpenCode, and GitHub Copilot CLI. Claude Code and Codex CLI are reachable
+  only via **Zed-maintained third-party adapters** (`claude-agent-acp`,
+  `codex-acp`), not official vendor support. Aider has no ACP support.
+- **This pattern already has prior art, and it's scrappy/immature.** Several
+  2026-vintage open-source projects already spawn multiple vendor CLIs
+  (Claude Code, Codex, Gemini CLI, etc.) as subprocess workers under one
+  orchestrator: **Bernstein, majiayu000/harness, claw-orchestrator, sage**
+  (the only one using ACP as a transport), **Zen MCP's `clink` tool,
+  ruvnet/metaharness, Parallel Code**. Most use raw subprocess/stdio
+  wrapping; a few use MCP. **No major vendor** (Claude Code, Goose,
+  OpenHands, Cline) supports spawning a *different* vendor's CLI as a
+  subagent themselves — cross-vendor orchestration is exclusively
+  third-party territory right now.
+- **The one consistently unsolved problem across every existing attempt**:
+  cross-vendor billing/cost reconciliation and permission-model bridging.
+  Nobody has done this cleanly yet — every project punts on it or leaves it
+  manual.
+
+**Conclusion**: the orchestration mechanics of "spawn Claude Code / Codex /
+Gemini CLI as a worker" are not themselves the differentiator — several
+scrappy projects already do this, and ACP (once more vendors adopt it) would
+make the transport layer easier to build, not a moat. The real, still-open
+whitespace is a **unified permission model and a single legible cost ledger
+across heterogeneous underlying agents** — that is the part worth designing
+for deliberately if `lite-harness` pursues the meta-harness direction. This
+is a **candidate differentiator, not yet a committed decision** — it should
+be weighed against the section 6 open questions (it raises the stakes on
+decoupled session/permission design even further, since the harness would
+need to *bridge*, not just enforce, a permission model across processes it
+doesn't control).

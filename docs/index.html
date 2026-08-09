@@ -272,6 +272,10 @@
         <div class="title">Autonomous agents &amp; frameworks</div>
         <div class="desc">Devin, OpenHands, SWE-agent, Google Jules, Replit Agent, LangGraph, AutoGen, CrewAI, Claude Agent SDK, OpenAI Agents SDK, AutoGPT</div>
       </a>
+      <a class="doc-link" href="research/raw/acp-and-meta-harness.md">
+        <div class="title">ACP &amp; the meta-harness pattern</div>
+        <div class="desc">Follow-up: could lite-harness orchestrate other harnesses (Claude Code, OpenCode, etc.) as subagents, and does the Agent Client Protocol help?</div>
+      </a>
       <a class="doc-link" href="research/agent-harness-landscape.md">
         <div class="title">Full synthesis document</div>
         <div class="desc">The complete write-up this page summarizes, including all sources and citations</div>
@@ -339,7 +343,21 @@
       <li>Side-effect-aware checkpointing (filesystem <em>and</em> external state like a database, not just conversation history).</li>
       <li>Governance/policy control over MCP servers.</li>
       <li>A harness natively decoupled from day one, rather than retrofitted after the fact.</li>
+      <li><strong>A meta-harness that orchestrates other vendors' harnesses as subagents</strong> — see below.</li>
     </ul>
+  </section>
+
+  <section>
+    <h2>Candidate USP: a "harness of harnesses"</h2>
+    <div class="card">
+      <p>Could <code>lite-harness</code> spin up <em>other</em> existing coding-agent harnesses — Claude Code, OpenCode, Codex CLI, Gemini CLI — as subagents, instead of only spawning homogeneous subagents of itself? Two follow-up research passes (full findings in <a href="research/raw/acp-and-meta-harness.md">acp-and-meta-harness.md</a>):</p>
+      <ul>
+        <li><strong>The Agent Client Protocol (ACP)</strong> is a real, spreading standard for client↔agent communication (native in Gemini CLI, Goose, OpenCode, GitHub Copilot CLI; Claude Code and Codex CLI reachable via Zed-maintained adapters). It has a rich session model, but it is <strong>strictly 1:1</strong> — no parent/child delegation, no task routing, no result-merging, no propagation of permission decisions across nested agents. It's a good transport, not an orchestration layer.</li>
+        <li><strong>This pattern already has prior art</strong>, and it's scrappy: 2026-vintage open-source projects (Bernstein, majiayu000/harness, claw-orchestrator, sage, Zen MCP's <code>clink</code>, ruvnet/metaharness, Parallel Code) already spawn multiple vendor CLIs as subprocess workers under one orchestrator — mostly via raw stdio wrapping. No major vendor supports spawning a <em>different</em> vendor's CLI as a subagent themselves.</li>
+        <li><strong>The one problem nobody has solved cleanly:</strong> a unified permission model and a single legible cost ledger across heterogeneous underlying agents. That's the real whitespace, not the orchestration mechanics.</li>
+      </ul>
+      <p class="dim">Status: candidate differentiator, not a committed decision.</p>
+    </div>
   </section>
 
   <section>
