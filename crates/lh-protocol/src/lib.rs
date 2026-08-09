@@ -121,6 +121,7 @@ pub mod methods {
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_TREE: &str = "session/tree";
     pub const PERMISSION_RESPOND: &str = "permission/respond";
+    pub const LEDGER_QUERY: &str = "ledger/query";
     /// Streamed daemon -> client notification carrying an `lh_event::Event`.
     pub const EVENT: &str = "event";
 }
@@ -161,6 +162,16 @@ pub struct SessionPromptResult {
 pub struct PermissionRespondParams {
     pub call_id: String,
     pub decision: lh_event::PermissionDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerQueryParams {
+    pub session_id: lh_event::SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerQueryResult {
+    pub rollup: lh_ledger::LedgerRollup,
 }
 
 // --- Newline-delimited JSON framing ---

@@ -14,8 +14,9 @@ use anyhow::{anyhow, Context, Result};
 use lh_event::{ContentBlock, Event, EventPayload, PermissionDecision};
 use lh_protocol::{
     buffered, default_socket_path, methods, read_message, write_message, InitializeParams,
-    InitializeResult, Message, PermissionRespondParams, Request, RequestId, SessionCreateParams,
-    SessionCreateResult, SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
+    InitializeResult, LedgerQueryParams, LedgerQueryResult, Message, PermissionRespondParams,
+    Request, RequestId, SessionCreateParams, SessionCreateResult, SessionPromptParams,
+    SessionPromptResult, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tokio::net::UnixStream;
@@ -105,6 +106,19 @@ async fn main() -> Result<()> {
                     let result: SessionPromptResult =
                         serde_json::from_value(resp.result.unwrap_or_default())?;
                     println!("\n[turn complete: {}]", result.stop_reason);
+
+                    match request::<LedgerQueryResult>(
+                        &mut write_half,
+                        &mut reader,
+                        &mut next_id,
+                        methods::LEDGER_QUERY,
+                        serde_json::to_value(LedgerQueryParams { session_id: create_result.session_id })?,
+                    )
+                    .await
+                    {
+                        Ok(ledger) => print_ledger(&ledger.rollup, 0),
+                        Err(e) => eprintln!("[ledger/query failed] {e}"),
+                    }
                 }
                 break;
             }
@@ -206,16 +220,30 @@ async fn ask_for_decision(
         request.tool_source,
         describe_action(&request.action)
     );
-    print!("  allow? [y/N]: ");
+    // Note: this prompt fires for every PermissionRequested event, even
+    // one the daemon already auto-resolved via a stored policy rule
+    // (architecture §6) -- the CLI can't yet distinguish "the daemon is
+    // waiting on me" from "already decided, this is just the audit log
+    // catching up" without a dedicated ask/reply round-trip. Answering
+    // here in that case is a harmless no-op (nothing is pending on the
+    // daemon side to resolve), but it's a known rough edge, not settled
+    // behavior -- flagged for a follow-up protocol change, not silently
+    // relied upon.
+    print!("  allow? [y/N/a=always-allow/d=always-deny]: ");
     std::io::stdout().flush().ok();
 
     let mut line = String::new();
     stdin.read_line(&mut line).await?;
     let answer = line.trim().to_ascii_lowercase();
-    Ok(if answer == "y" || answer == "yes" {
-        PermissionDecision::Allow
-    } else {
-        PermissionDecision::Deny
+    Ok(match answer.as_str() {
+        "y" | "yes" => PermissionDecision::Allow,
+        "a" | "always" => PermissionDecision::AllowAlways {
+            scope: lh_event::PolicyScope::Project,
+        },
+        "d" | "always-deny" => PermissionDecision::DenyAlways {
+            scope: lh_event::PolicyScope::Project,
+        },
+        _ => PermissionDecision::Deny,
     })
 }
 
@@ -289,6 +317,21 @@ fn render_content(blocks: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn print_ledger(rollup: &lh_ledger::LedgerRollup, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let cost = match rollup.cost_usd {
+        Some(c) => format!("${c:.6}"),
+        None => "$?".to_string(),
+    };
+    println!(
+        "{indent}[ledger] session {} cost={cost} ({:?}) in={:?} out={:?} turns={}",
+        rollup.session_id, rollup.confidence, rollup.input_tokens, rollup.output_tokens, rollup.turns
+    );
+    for child in &rollup.children {
+        print_ledger(child, depth + 1);
+    }
 }
 
 fn source_label(source: &lh_event::ToolSource) -> String {

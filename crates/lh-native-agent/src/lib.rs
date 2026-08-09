@@ -6,9 +6,10 @@
 //! state-changing primitive" applies here too: this loop never talks to a
 //! socket directly, only to the store).
 //!
-//! Phase 2 scope, explicitly: no sandboxing (tools run directly on the
-//! host, flagged dev-only), no policy persistence (every tool call is
-//! asked about, via `PermissionEngine`), no subagents, no ACP.
+//! Sandboxing (Landlock/Seatbelt) lives behind the `ExecutionPlane` this
+//! loop is handed at construction (`lh-execution`, architecture §8).
+//! Phase 3 scope beyond that: still no policy persistence (every tool call
+//! is asked about, via `PermissionEngine`), no subagents, no ACP.
 
 mod tools;
 
@@ -17,15 +18,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lh_event::{
-    Actor, ContentBlock, DecisionSource, Event, EventPayload, PermissionDecision,
-    PermissionRequest, SessionId, ToolCall, ToolCallStatus, ToolSource, UsageConfidence,
-    UsageDelta,
+    Actor, ContentBlock, Event, EventPayload, PermissionDecision, PermissionRequest, SessionId,
+    ToolCall, ToolCallStatus, ToolSource, UsageConfidence, UsageDelta,
 };
+use lh_execution::ExecutionPlane;
 use lh_model_provider::{ChatContent, ChatMessage, ChatRole, ModelProvider, ModelRequest};
 use lh_permission::PermissionEngine;
 use lh_store::SessionStore;
 
-pub use tools::{builtin_tool_specs, execute_tool, ToolError};
+pub use tools::builtin_tool_specs;
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
@@ -47,6 +48,11 @@ pub enum TurnOutcome {
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// The provider's own name (`ModelProviderConfig.name`, §13.2) -- used
+    /// only to look up pricing (`lh-ledger`), not to select the provider
+    /// itself (that's already fixed by which `ModelProvider` this loop was
+    /// constructed with).
+    pub provider_name: String,
     pub model: String,
     pub system_prompt: String,
     pub max_tokens: u32,
@@ -60,6 +66,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
+            provider_name: "unset".to_string(),
             model: "unset".to_string(),
             system_prompt: "You are a careful, concise coding assistant. Use the available \
                 tools when you need to read or change files or run commands."
@@ -75,6 +82,8 @@ pub struct NativeAgentLoop {
     store: Arc<dyn SessionStore>,
     model_provider: Arc<dyn ModelProvider>,
     permission_engine: Arc<dyn PermissionEngine>,
+    execution_plane: Arc<dyn ExecutionPlane>,
+    pricing: Arc<lh_ledger::PricingTable>,
     config: AgentConfig,
 }
 
@@ -83,12 +92,16 @@ impl NativeAgentLoop {
         store: Arc<dyn SessionStore>,
         model_provider: Arc<dyn ModelProvider>,
         permission_engine: Arc<dyn PermissionEngine>,
+        execution_plane: Arc<dyn ExecutionPlane>,
+        pricing: Arc<lh_ledger::PricingTable>,
         config: AgentConfig,
     ) -> Self {
         Self {
             store,
             model_provider,
             permission_engine,
+            execution_plane,
+            pricing,
             config,
         }
     }
@@ -153,7 +166,7 @@ impl NativeAgentLoop {
                     session_id,
                     Actor::System,
                     EventPayload::UsageReported {
-                        usage: usage_acc.finish(),
+                        usage: usage_acc.finish(&self.config.provider_name, &self.config.model, &self.pricing),
                     },
                 )
                 .await?;
@@ -230,7 +243,7 @@ impl NativeAgentLoop {
         self.emit(
             session_id,
             Actor::Agent,
-            EventPayload::ToolCallRequested { call },
+            EventPayload::ToolCallRequested { call: call.clone() },
         )
         .await?;
 
@@ -250,21 +263,22 @@ impl NativeAgentLoop {
         )
         .await?;
 
-        let decision = self.permission_engine.decide(&request).await?;
+        let resolution = self.permission_engine.decide(&request).await?;
+        let decision = resolution.decision;
         self.emit(
             session_id,
             Actor::System,
             EventPayload::PermissionDecided {
                 call_id: call_id.to_string(),
                 decision: decision.clone(),
-                decided_by: DecisionSource::User,
+                decided_by: resolution.source,
             },
         )
         .await?;
 
-        let (status, output, is_error) = match decision {
+        let (status, output, is_error) = match &decision {
             PermissionDecision::Allow | PermissionDecision::AllowAlways { .. } => {
-                match execute_tool(tool_name, input, &self.config.workspace_root).await {
+                match self.execution_plane.execute(&call, &decision).await {
                     Ok(out) => (ToolCallStatus::Completed, out, false),
                     Err(e) => (ToolCallStatus::Failed, e.to_string(), true),
                 }
@@ -314,22 +328,42 @@ impl UsageAccumulator {
         }
     }
 
-    fn finish(self) -> UsageDelta {
+    fn finish(self, provider_name: &str, model: &str, pricing: &lh_ledger::PricingTable) -> UsageDelta {
+        let token_confidence = if self.any_unknown {
+            UsageConfidence::Unknown
+        } else {
+            UsageConfidence::Exact
+        };
+
+        // Pricing (architecture §7/§13.3): a known (provider, model) with
+        // known token counts gets a real dollar figure; anything else --
+        // an unpriced/self-hosted model, or a provider that didn't report
+        // usage -- stays an honest `Unknown` rather than a guess.
+        let (cost_usd, price_confidence) =
+            lh_ledger::price_usage(pricing, provider_name, model, self.input_tokens, self.output_tokens);
+
         UsageDelta {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            // No ModelPricing lookup wired up yet (that's the cost-ledger
-            // crate, not built this phase) -- record token counts honestly
-            // and leave cost unresolved rather than fabricate a number
-            // (architecture §7/§13.3's "honest gap" pattern).
-            cost_usd: None,
+            cost_usd,
             wall_ms: self.wall_ms,
-            confidence: if self.any_unknown {
-                UsageConfidence::Unknown
-            } else {
-                UsageConfidence::Exact
-            },
+            confidence: worse(token_confidence, price_confidence),
         }
+    }
+}
+
+fn worse(a: UsageConfidence, b: UsageConfidence) -> UsageConfidence {
+    fn rank(c: UsageConfidence) -> u8 {
+        match c {
+            UsageConfidence::Exact => 0,
+            UsageConfidence::Estimated => 1,
+            UsageConfidence::Unknown => 2,
+        }
+    }
+    if rank(a) >= rank(b) {
+        a
+    } else {
+        b
     }
 }
 
@@ -377,8 +411,11 @@ mod tests {
 
     #[async_trait]
     impl PermissionEngine for FixedDecisionEngine {
-        async fn decide(&self, _req: &PermissionRequest) -> lh_permission::Result<PermissionDecision> {
-            Ok(self.0.clone())
+        async fn decide(&self, _req: &PermissionRequest) -> lh_permission::Result<lh_permission::PermissionResolution> {
+            Ok(lh_permission::PermissionResolution {
+                decision: self.0.clone(),
+                source: lh_event::DecisionSource::User,
+            })
         }
     }
 
@@ -408,8 +445,17 @@ mod tests {
         }
     }
 
+    async fn local_plane(workspace_root: &std::path::Path) -> Arc<dyn ExecutionPlane> {
+        Arc::new(
+            lh_execution::LocalExecutionPlane::new(workspace_root.to_path_buf())
+                .await
+                .unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn a_plain_text_turn_ends_without_any_tool_calls() {
+        let workspace = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
         let provider = Arc::new(ScriptedModelProvider::new(vec![text_response("hi there")]));
         let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
@@ -419,8 +465,11 @@ mod tests {
             store.clone(),
             provider,
             engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
             AgentConfig {
                 model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
                 ..Default::default()
             },
         );
@@ -450,6 +499,8 @@ mod tests {
             store.clone(),
             provider,
             engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -506,6 +557,8 @@ mod tests {
             store.clone(),
             provider,
             engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),

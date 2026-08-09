@@ -1,16 +1,17 @@
 [package]
-name = "lh-permission"
+name = "lh-ledger"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 lh-event = { path = "../lh-event" }
-serde.workspace = true
-serde_json.workspace = true
-toml.workspace = true
+lh-store = { path = "../lh-store" }
 async-trait.workspace = true
-tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+toml.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true

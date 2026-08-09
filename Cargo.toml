@@ -6,6 +6,8 @@ members = [
     "crates/lh-protocol",
     "crates/lh-model-provider",
     "crates/lh-permission",
+    "crates/lh-execution",
+    "crates/lh-ledger",
     "crates/lh-native-agent",
     "crates/lh-daemon",
     "crates/lh-cli",

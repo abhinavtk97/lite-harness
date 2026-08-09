@@ -13,6 +13,7 @@ use lh_model_provider::ModelProvider;
 
 pub struct ResolvedProvider {
     pub provider: Arc<dyn ModelProvider>,
+    pub name: String,
     pub model: String,
 }
 
@@ -48,6 +49,7 @@ pub fn resolve_default_provider() -> Result<Option<ResolvedProvider>> {
 
     Ok(Some(ResolvedProvider {
         provider,
+        name: cfg.name.clone(),
         model: cfg.default_model.clone(),
     }))
 }

@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 lh-event = { path = "../lh-event" }
+lh-ledger = { path = "../lh-ledger" }
 lh-protocol = { path = "../lh-protocol" }
 serde.workspace = true
 serde_json.workspace = true

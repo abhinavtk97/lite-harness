@@ -1,16 +1,17 @@
 [package]
-name = "lh-permission"
+name = "lh-execution"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 lh-event = { path = "../lh-event" }
-serde.workspace = true
-serde_json.workspace = true
-toml.workspace = true
 async-trait.workspace = true
-tokio.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true
