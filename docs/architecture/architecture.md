@@ -493,7 +493,7 @@ Recursive delegation (a delegated primary delegates to agent B, which — if als
 - `max_delegation_depth` (default 3) — counts tree depth from the root; `delegate()` refuses and returns an error to the calling agent once exceeded, logging an `Error` event.
 - `max_concurrent_children` per session-tree (default 10, matching the precedent found in Goose's research) — caps fan-out width, not just depth.
 
-**Judgment call, flagged for review**: whether every delegated agent gets the orchestration MCP server by default (full recursive nesting, matching "spin up subagents in any other harness" as literally as possible) or only the *primary* gets it by default, with children remaining leaves unless a session explicitly opts into `allow_nested_delegation`. Recommendation: default children to leaves (today's proven §5 behavior — predictable cost/blast-radius) and require explicit opt-in for deeper nesting — a product/safety call, not a technical constraint, flippable by changing one default without touching the mechanism.
+**Decided**: only the *primary* driver gets the orchestration MCP server by default. Delegated children remain leaves (today's proven §5 behavior — predictable cost/blast-radius, least-privilege) unless a session explicitly opts into `allow_nested_delegation`. `max_delegation_depth`/`max_concurrent_children` remain as a structural backstop regardless, but recursive nesting itself is opt-in, not the default — flippable per-session without touching the mechanism.
 
 ### 12.5 Agent registry and CLI surface
 
@@ -552,7 +552,7 @@ Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permissio
 7. **Web UI** — `lh-web-backend` as a pure protocol client, `lh-web-ui` as presentation only. Should be "just write a UI," not "extend the core."
 8. **Expand delegated-agent set** (Codex via `codex-acp`, then Gemini CLI/Goose/OpenCode natively), MCP integration, remote/container execution plane, richer policy, Windows support — additive against the traits established in phases 1-4 and 6.
 
-**Open judgment call, flagged for review**: phase 4 (ACP) is placed before full native-agent polish and before native subagents, on the theory that proving cross-agent-type permission/cost unification early — while the surface area is small — reduces the riskiest unknown (the exact shape of `claude-agent-acp`'s permission-request payloads and usage-reporting fields won't be fully known until integrated against) sooner. If the team judges native-agent maturity as the more urgent near-term risk, phases 3 and 4 can be swapped with no architectural change.
+**Decided**: phase 4 (ACP) stays before native subagents (phase 5), on the theory that proving cross-agent-type permission/cost unification early — while the surface area is small — reduces the riskiest unknown (the exact shape of `claude-agent-acp`'s permission-request payloads and usage-reporting fields won't be fully known until integrated against) sooner, and native subagents are a simplification of the same `ChildRunner` foundation the ACP slice already has to build.
 
 ---
 

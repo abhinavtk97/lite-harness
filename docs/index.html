@@ -388,6 +388,8 @@
         <li><strong>v1 delegated-agent set</strong>: just one external agent to start (Claude Code, via the existing <code>claude-agent-acp</code> adapter — no new ACP adapters are being built), to prove the architecture end-to-end before generalizing to Codex/Gemini CLI/Goose/OpenCode.</li>
         <li><strong>Primary agent substitution</strong>: a third-party agent (e.g. Claude Code) can drive a session as the <em>primary/root</em> instead of lite-harness's own native loop, and still retains full delegate-to-other-harnesses power via an MCP tool bridge (<code>delegate_task</code>) — see <a href="architecture/index.html#primary">Architecture &sect;12</a>.</li>
         <li><strong>Model providers</strong>: the native agent loop is provider-agnostic, bring-your-own-key, with a configurable custom base URL (self-hosted proxies, Azure OpenAI, OpenRouter, local model servers like Ollama/vLLM) — not hard-wired to a single vendor, from its very first implementation — see <a href="architecture/index.html#model-providers">Architecture &sect;13</a>.</li>
+        <li><strong>Build-phasing order</strong>: the ACP vertical slice (delegating to Claude Code) stays scheduled before native subagents — proving the cross-agent permission/cost differentiator early beats maturing the native loop first, and native subagents are a simplification of the same foundation the ACP slice already builds. See <a href="architecture/index.html#phasing">Architecture &sect;11</a>.</li>
+        <li><strong>Nested delegation default</strong>: only the primary driver gets the <code>delegate_task</code> MCP tool by default; delegated children stay leaves unless a session explicitly opts into <code>allow_nested_delegation</code> — predictable cost/blast-radius over maximal literalism. See <a href="architecture/index.html#primary">Architecture &sect;12.4</a>.</li>
       </ul>
     </div>
   </section>
@@ -396,9 +398,7 @@
     <h2>Remaining open questions</h2>
     <div class="card">
       <ul>
-        <li>Whether to swap the build-phasing order flagged as a judgment call on the <a href="architecture/index.html#phasing">Architecture page</a> (proving the ACP vertical slice early vs. maturing the native agent first).</li>
-        <li>Whether nested delegated agents get the <code>delegate_task</code> MCP tool by default, or only the primary driver does (flagged as a judgment call in <a href="architecture/index.html#primary">Architecture &sect;12.4</a>).</li>
-        <li>Windows support timeline (out of scope for v1 per the current sandboxing design).</li>
+        <li>Windows support timeline — explicitly deprioritized for now, out of scope for v1 per the current sandboxing design (§8 assumes Landlock/Seatbelt).</li>
       </ul>
     </div>
   </section>

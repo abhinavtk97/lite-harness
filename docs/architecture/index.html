@@ -701,7 +701,7 @@ pub trait DelegationService: Send + Sync {
       <li><code>max_delegation_depth</code> (default 3) — counts tree depth from the root; <code>delegate()</code> refuses and returns an error to the calling agent once exceeded, logging an <code>Error</code> event.</li>
       <li><code>max_concurrent_children</code> per session-tree (default 10, matching the precedent found in Goose's research) — caps fan-out width, not just depth.</li>
     </ul>
-    <div class="judgment"><strong>Judgment call, flagged for review</strong>: whether every delegated agent gets the orchestration MCP server by default (full recursive nesting, matching "spin up subagents in any other harness" as literally as possible) or only the <em>primary</em> gets it by default, with children remaining leaves unless a session explicitly opts into <code>allow_nested_delegation</code>. Recommendation: default children to leaves (today's proven §5 behavior — predictable cost/blast-radius) and require explicit opt-in for deeper nesting — a product/safety call, not a technical constraint, flippable by changing one default without touching the mechanism.</div>
+    <div class="judgment"><strong>Decided</strong>: only the <em>primary</em> driver gets the orchestration MCP server by default. Delegated children remain leaves (today's proven §5 behavior — predictable cost/blast-radius, least-privilege) unless a session explicitly opts into <code>allow_nested_delegation</code>. <code>max_delegation_depth</code>/<code>max_concurrent_children</code> remain as a structural backstop regardless, but recursive nesting itself is opt-in, not the default — flippable per-session without touching the mechanism.</div>
 
     <h3>12.5 Agent registry and CLI surface</h3>
     <p><code>DelegatedAgentAdapter</code> (§5.2) gains a capability flag:</p>
@@ -750,7 +750,7 @@ pub trait DelegationService: Send + Sync {
       <li><strong>Web UI</strong> — <code>lh-web-backend</code> as a pure protocol client, <code>lh-web-ui</code> as presentation only. Should be "just write a UI," not "extend the core."</li>
       <li><strong>Expand delegated-agent set</strong> (Codex via <code>codex-acp</code>, then Gemini CLI/Goose/OpenCode natively), MCP integration, remote/container execution plane, richer policy, Windows support — additive against the traits established in phases 1-4 and 6.</li>
     </ol>
-    <div class="judgment"><strong>Open judgment call, flagged for review</strong>: phase 4 (ACP) is placed before full native-agent polish and before native subagents, on the theory that proving cross-agent-type permission/cost unification early — while the surface area is small — reduces the riskiest unknown sooner. If the team judges native-agent maturity as the more urgent near-term risk, phases 3 and 4 can be swapped with no architectural change.</div>
+    <div class="judgment"><strong>Decided</strong>: phase 4 (ACP) stays before native subagents (phase 5), on the theory that proving cross-agent-type permission/cost unification early — while the surface area is small — reduces the riskiest unknown sooner, and native subagents are a simplification of the same <code>ChildRunner</code> foundation the ACP slice already has to build.</div>
   </section>
 
   <section>
