@@ -15,6 +15,8 @@ The project has now moved from research to architecture, with one crucial scope 
 
 This document is the detailed architecture that follows from those decisions and from the ten design principles established in the prior research phase (event-log-as-substrate, UI-agnostic core, decoupled reasoning/execution planes, pluggable session storage, permission enforcement inside the core not the UI, structural gates on destructive actions, typed multi-agent control flow, built-in cost/observability, ACI-style tool design, and MCP governed through the same boundary as everything else).
 
+**Addendum**: §12 adds one more capability — letting a third-party agent (e.g. Claude Code) act as the *primary/root* driver of a session instead of lite-harness's own native agent loop, while retaining full "spin up subagents in any other harness" delegation power even when the primary is itself delegated. It's a generalization of the session model and ACP module already defined in §3, §5, and §9, not a redesign of them.
+
 ---
 
 ## 1. High-level component diagram
@@ -358,29 +360,140 @@ pub trait ChildRunner: Send + Sync {
 
 ---
 
+## 12. Primary agent substitution — any agent can drive the root session, and can itself delegate further
+
+**Requirement**: the user can choose Claude Code (or any other ACP-capable agent) as the *root/primary* driver of a session instead of lite-harness's native loop — and that substituted primary must retain the same "spin up subagents in other harnesses" capability the native loop has (§9).
+
+**Key insight**: nothing about ACP's spawn/connect flow (§5) cares whether the session it creates is attached as our tree's *root* or as a *child* — `HarnessAcpClient` behaves identically either way. The only structural change needed is generalizing "who owns a session" from an implicit "native loop owns the root" assumption into an explicit, per-session `SessionDriver` value that applies uniformly to root and child sessions alike.
+
+### 12.1 `SessionDriver` — generalizing root and child alike
+
+```rust
+pub enum SessionDriver { Native, Delegated(AgentKind) }
+```
+
+Every session (root or child) gets exactly one `SessionDriverSet` event, appended once at creation, recording which driver owns it:
+
+```rust
+pub enum EventPayload {
+    ...
+    SessionDriverSet { driver: SessionDriver },
+    ...
+}
+```
+
+This subsumes what `ChildKind::NativeSubagent`/`ChildKind::Delegated` already recorded for children (§3) — kept as-is for the parent-child *relationship* record, while `SessionDriverSet` is the session's own self-description, valid for a root with no parent too. `Actor` simplifies correspondingly: since "which agent kind drove this session" is now recorded once via `SessionDriverSet` rather than repeated on every event, `Actor::NativeSubagent{..}`/`Actor::DelegatedAgent{..}` collapse into one `Actor::Agent` (looked up via the session's own `SessionDriverSet`), removing redundancy from the original §3 design.
+
+`session/create` on the Harness Protocol (§4) gains a field:
+
+```rust
+pub struct SessionCreateRequest {
+    pub cwd: PathBuf,
+    pub primary: PrimarySelector,   // NEW
+}
+
+pub enum PrimarySelector {
+    Native,                  // today's default — lite-harness's own agent loop
+    Delegated(AgentKind),    // e.g. AgentKind::ClaudeCode drives this session as root
+}
+```
+
+When `Delegated(AgentKind::ClaudeCode)` is selected, the daemon runs the *exact* spawn flow already defined in §5 (spawn `claude-agent-acp`, ACP `initialize` → `session/new`) — the only difference from a delegated *child* is that the resulting session becomes the tree's root instead of being attached under a native parent via `ChildSessionSpawned`.
+
+### 12.2 How a delegated primary "spins up subagents in other harnesses" — MCP as the delegation bridge
+
+A delegated agent (Claude Code, running as primary) is an external process that knows nothing about lite-harness's other adapters or its `ChildRunner` trait — it can't call our Rust code directly. ACP's own `session/new` request, however, already supports declaring MCP servers for that session (confirmed during the earlier ACP research spike). This is the bridge: **lite-harness runs its own local MCP server (`lh-orchestration-mcp`) exposing a `delegate_task` tool, and passes it into the `mcpServers` list of every ACP session it creates for a delegated driver.** From Claude Code's point of view, "delegate this subtask to Codex" is just calling an MCP tool — a capability every modern coding-agent CLI already supports — not a bespoke lite-harness-specific mechanism.
+
+```rust
+// lh-orchestration-mcp: a small MCP server, embedded in the daemon.
+// Tool exposed to any driving agent (native subagent context, or a
+// delegated primary/child's ACP session alike):
+//   delegate_task(target_agent: string, task: string, context?: object) -> DelegationResult
+async fn handle_delegate_task(call: McpToolCall, ctx: &OrchestrationCtx) -> Result<DelegationResult> {
+    let req = PermissionRequest {
+        session_id: ctx.session_id,
+        tool_source: ToolSource::Mcp("lh-orchestration".into(), "delegate_task".into()),
+        action: PermissionAction::DelegateAgent {
+            target: parse_agent_kind(&call.args["target_agent"])?,
+            task_summary: call.args["task"].as_str().unwrap_or_default().to_string(),
+        },
+        risk_tier: RiskTier::Execute,
+    };
+    let decision = ctx.permission_engine.decide(&req).await?;
+    // same ChildRunner/AcpDelegatedRunner machinery as §5/§9 — no new
+    // delegation logic, only a new (MCP) entry point into it
+    ctx.delegation_service.run(ctx.session_id, TaskHandoff::from(req)).await
+}
+```
+
+This is the key architectural payoff: **delegation itself becomes just another gated tool call**, flowing through the identical `PermissionEngine::decide()` path as every other action (§6) — no parallel trust boundary for "meta" actions. A new `PermissionAction::DelegateAgent` variant is added (rather than reusing the generic `McpToolCall` catch-all) specifically so operators get a dedicated policy lever — e.g. "always ask before delegating to any external agent" — independent of blanket MCP policy.
+
+### 12.3 A driver-neutral delegation service (crate-layout refinement)
+
+The supervisor logic originally described in §9 as living inside `lh-native-agent` is generalized into its own crate, `lh-orchestration`, called from two entry points:
+- **In-process**: the native agent loop's own supervisor calls `DelegationService` directly via the `ChildRunner` trait (unchanged from §9) when it decides to delegate.
+- **Out-of-process**: `lh-orchestration-mcp`'s tool handler calls the same `DelegationService` on behalf of whichever agent is driving the current session — the native loop, a delegated primary, or (if nested delegation is enabled, §12.4) a delegated child.
+
+```rust
+#[async_trait]
+pub trait DelegationService: Send + Sync {
+    async fn delegate(&self, from_session: SessionId, task: TaskHandoff, target: AgentKind) -> Result<ChildOutcome>;
+}
+```
+
+`lh-native-agent` and `lh-orchestration-mcp` both depend on `lh-orchestration`; neither depends on the other. This keeps the "native loop is just one more caller of shared orchestration machinery" property that made §9 clean in the first place.
+
+### 12.4 Depth and fan-out limits — a structural cap, not a convention
+
+Recursive delegation (a delegated primary delegates to agent B, which — if also given the orchestration MCP server — delegates to agent C) reproduces exactly the runaway-loop/cost-blowup failure class the research flagged against AutoGPT. Two structural, config-driven caps enforced inside `DelegationService::delegate` itself, not just documented as best practice:
+
+- `max_delegation_depth` (default 3) — counts tree depth from the root; `delegate()` refuses and returns an error to the calling agent once exceeded, logging an `Error` event.
+- `max_concurrent_children` per session-tree (default 10, matching the precedent found in Goose's research) — caps fan-out width, not just depth.
+
+**Judgment call, flagged for review**: whether every delegated agent gets the orchestration MCP server by default (full recursive nesting, matching "spin up subagents in any other harness" as literally as possible) or only the *primary* gets it by default, with children remaining leaves unless a session explicitly opts into `allow_nested_delegation`. Recommendation: default children to leaves (today's proven §5 behavior — predictable cost/blast-radius) and require explicit opt-in for deeper nesting — a product/safety call, not a technical constraint, flippable by changing one default without touching the mechanism.
+
+### 12.5 Agent registry and CLI surface
+
+`DelegatedAgentAdapter` (§5.2) gains a capability flag:
+
+```rust
+pub struct DelegatedAgentAdapter {
+    ...
+    pub can_be_primary: bool,   // NEW — can this adapter act as session root?
+}
+```
+
+Most adapters default `true` — nothing about being "primary" vs. "child" differs from ACP's perspective, per §12.1. `false` is reserved for an adapter that, for some tool-specific reason, can't sensibly drive a whole session (e.g. a narrowly-scoped worker agent). `agents/list` over the Harness Protocol surfaces this flag so UIs can build a "which agent should drive this session?" picker that only offers valid choices.
+
+CLI: `lite-harness run --agent claude-code "<prompt>"` selects `PrimarySelector::Delegated(AgentKind::ClaudeCode)` at `session/create`; omitting `--agent` keeps today's default (`PrimarySelector::Native`).
+
+---
+
 ## 10. Cargo workspace layout
 
 ```
 lite-harness/
 ├── Cargo.toml
 ├── crates/
-│   ├── lh-event            # Event/EventPayload/ToolCall/session-tree types — near-zero deps
-│   ├── lh-store             # SessionStore trait + SqliteSessionStore impl
-│   ├── lh-permission         # PermissionEngine trait, DefaultPermissionEngine, policy model
-│   ├── lh-execution           # ExecutionPlane trait, LocalExecutionPlane (Landlock/Seatbelt)
-│   ├── lh-ledger               # CostLedger rollup logic, UsageDelta, ModelPricing
-│   ├── lh-native-agent           # NativeAgentLoop, ChildRunner/NativeSubagentRunner, built-in tools
-│   ├── lh-mcp                     # MCP client integration for native tools — routes via lh-permission
-│   ├── lh-acp                      # HarnessAcpClient, agent registry, DelegatedAgentAdapter
-│   ├── lh-protocol                  # Harness Protocol wire types + JSON-RPC framing
-│   ├── lh-daemon                     # lite-harnessd binary — wires everything, owns UDS listener
-│   ├── lh-cli                         # lite-harness binary — thin Harness Protocol client
-│   ├── lh-web-backend                  # local web server — Harness Protocol client, websocket bridge
-│   └── lh-web-ui                        # presentation only, over lh-web-backend's API
-└── xtask/                                # dev tooling, integration harness with a fake ACP agent
+│   ├── lh-event               # Event/EventPayload/ToolCall/session-tree types — near-zero deps
+│   ├── lh-store                # SessionStore trait + SqliteSessionStore impl
+│   ├── lh-permission             # PermissionEngine trait, DefaultPermissionEngine, policy model
+│   ├── lh-execution                # ExecutionPlane trait, LocalExecutionPlane (Landlock/Seatbelt)
+│   ├── lh-ledger                     # CostLedger rollup logic, UsageDelta, ModelPricing
+│   ├── lh-orchestration                # DelegationService — driver-neutral supervisor logic (§9, §12.3)
+│   ├── lh-native-agent                   # NativeAgentLoop, built-in tools (calls lh-orchestration to delegate)
+│   ├── lh-mcp                              # MCP client integration for native tools — routes via lh-permission
+│   ├── lh-orchestration-mcp                  # MCP SERVER exposing delegate_task to any driving agent (§12.2)
+│   ├── lh-acp                                  # HarnessAcpClient, agent registry, DelegatedAgentAdapter
+│   ├── lh-protocol                               # Harness Protocol wire types + JSON-RPC framing
+│   ├── lh-daemon                                   # lite-harnessd binary — wires everything, owns UDS listener
+│   ├── lh-cli                                        # lite-harness binary — thin Harness Protocol client
+│   ├── lh-web-backend                                  # local web server — Harness Protocol client, ws bridge
+│   └── lh-web-ui                                         # presentation only, over lh-web-backend's API
+└── xtask/                                                  # dev tooling, integration harness w/ a fake ACP agent
 ```
 
-Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permission`, `lh-execution`, `lh-ledger` are independent siblings depending only on `lh-event`; `lh-native-agent`/`lh-mcp`/`lh-acp` depend on those plus `lh-event`; `lh-daemon` is the only crate that constructs concrete implementations and wires trait objects together; `lh-cli`/`lh-web-backend` depend **only** on `lh-protocol` — a compile-time enforcement of "the UI is never load-bearing."
+Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permission`, `lh-execution`, `lh-ledger` are independent siblings depending only on `lh-event`; `lh-orchestration` (the driver-neutral `DelegationService`, §12.3) depends on those plus `lh-event`; `lh-native-agent`, `lh-mcp`, `lh-orchestration-mcp`, and `lh-acp` all depend on `lh-orchestration` but not on each other — `lh-native-agent` calls delegation in-process, `lh-orchestration-mcp` exposes the identical capability to any out-of-process driving agent; `lh-daemon` is the only crate that constructs concrete implementations and wires trait objects together; `lh-cli`/`lh-web-backend` depend **only** on `lh-protocol` — a compile-time enforcement of "the UI is never load-bearing."
 
 ---
 
@@ -391,8 +504,9 @@ Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permissio
 3. **Real sandboxing** — `LocalExecutionPlane` with Landlock (Linux first), policy persistence (`.lite-harness/policy.toml`), native cost ledger.
 4. **The ACP vertical slice — the architecture's actual proof point** — `lh-acp`, `HarnessAcpClient`, the Claude Code adapter, one delegated task end-to-end. The test that matters: **one permission-prompt path** handles both a native tool call and a Claude-Code-originated one, and the cost ledger shows one aggregated total across both. Everything after this phase is expansion, not new architecture.
 5. **Native subagents** — `ChildRunner`/`NativeSubagentRunner`, session-tree fork/resume. Should require touching `lh-permission`/`lh-ledger` not at all — itself a validation that those abstractions were shaped correctly.
-6. **Web UI** — `lh-web-backend` as a pure protocol client, `lh-web-ui` as presentation only. Should be "just write a UI," not "extend the core."
-7. **Expand delegated-agent set** (Codex via `codex-acp`, then Gemini CLI/Goose/OpenCode natively), MCP integration, remote/container execution plane, richer policy, Windows support — additive against the traits established in phases 1-4.
+6. **Primary agent substitution (§12)** — extract `lh-orchestration` out of `lh-native-agent` (should be a pure refactor at this point, since phase 5 already proved the `ChildRunner` shape), add `SessionDriver`/`SessionDriverSet` and `PrimarySelector` to `session/create`, and build `lh-orchestration-mcp` exposing `delegate_task`. Acceptance test: run a session with `--agent claude-code`, have Claude Code call `delegate_task` to hand a subtask to the same delegated Claude Code adapter (simplest possible loopback case) or, once available, to Codex — confirm the resulting child session, permission prompt, and cost-ledger line look identical in shape to a native-loop-initiated delegation from phase 4.
+7. **Web UI** — `lh-web-backend` as a pure protocol client, `lh-web-ui` as presentation only. Should be "just write a UI," not "extend the core."
+8. **Expand delegated-agent set** (Codex via `codex-acp`, then Gemini CLI/Goose/OpenCode natively), MCP integration, remote/container execution plane, richer policy, Windows support — additive against the traits established in phases 1-4 and 6.
 
 **Open judgment call, flagged for review**: phase 4 (ACP) is placed before full native-agent polish and before native subagents, on the theory that proving cross-agent-type permission/cost unification early — while the surface area is small — reduces the riskiest unknown (the exact shape of `claude-agent-acp`'s permission-request payloads and usage-reporting fields won't be fully known until integrated against) sooner. If the team judges native-agent maturity as the more urgent near-term risk, phases 3 and 4 can be swapped with no architectural change.
 
@@ -405,6 +519,8 @@ Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permissio
 - `crates/lh-permission/src/lib.rs` — `PermissionEngine` trait, `PermissionRequest`/`PermissionDecision`, policy resolution (§6) — the load-bearing abstraction for the project's core differentiator.
 - `crates/lh-acp/src/client.rs` — `HarnessAcpClient`'s `impl acp::Client`, ACP-to-`Event` translation, `DelegatedAgentAdapter`/agent registry (§5) — the other half of the differentiator, and the piece with the most external-crate integration risk.
 - `crates/lh-daemon/src/main.rs` — wires concrete `SessionStore`/`PermissionEngine`/`ExecutionPlane`/`ChildRunner` implementations together (§2, §10) — proof the whole architecture compiles as one system.
+- `crates/lh-orchestration/src/lib.rs` — `DelegationService`/`ChildRunner` (§9, §12.3) — the driver-neutral abstraction that lets both the native loop and `lh-orchestration-mcp` trigger delegation through one path.
+- `crates/lh-orchestration-mcp/src/lib.rs` — the `delegate_task` MCP server (§12.2) — the concrete bridge that lets an external primary agent (or, once opted in, a nested delegated child) request further delegation.
 
 ---
 
@@ -412,5 +528,6 @@ Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permissio
 
 This phase produces a design document, not running code, so "verification" means: the plan is internally consistent and testable against the stated requirements before any Rust is written.
 
-- Cross-check §1-11 against the ten design principles from the research phase — confirm each principle maps to a concrete mechanism above, not just a restated goal. Spot checks: principle 5 → §6's `proof: &PermissionDecision` argument; principle 4 → §3's `SessionStore` trait; principle 1 → §3's `Event` as the sole state-changing primitive.
-- Once Phases 1-4 above are implemented, the concrete acceptance test for "the architecture works" is: from the CLI, run one task that triggers both a native tool call and a delegated Claude Code tool call in the same session, see both permission prompts rendered identically (differing only in the displayed `ToolSource`), and see one `ledger/query` response with a combined cost total covering both.
+- Cross-check §1-12 against the ten design principles from the research phase — confirm each principle maps to a concrete mechanism above, not just a restated goal. Spot checks: principle 5 → §6's `proof: &PermissionDecision` argument; principle 4 → §3's `SessionStore` trait; principle 1 → §3's `Event` as the sole state-changing primitive.
+- Once phases 1-4 above are implemented, the concrete acceptance test for "the architecture works" is: from the CLI, run one task that triggers both a native tool call and a delegated Claude Code tool call in the same session, see both permission prompts rendered identically (differing only in the displayed `ToolSource`), and see one `ledger/query` response with a combined cost total covering both.
+- Once phase 6 (§12) is implemented, the acceptance test for "primary substitution works" is: `lite-harness run --agent claude-code "<prompt>"` produces a root session whose `SessionDriverSet` says `Delegated(ClaudeCode)`, Claude Code successfully calls the `delegate_task` MCP tool mid-session, a child session is created through the exact same code path phase 4 already proved, and the resulting permission prompt / cost-ledger entry are indistinguishable in shape from a native-loop-initiated delegation.

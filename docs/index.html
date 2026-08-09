@@ -386,6 +386,7 @@
         <li><strong>Language/runtime</strong>: Rust for the core engine.</li>
         <li><strong>Deployment model (v1)</strong>: local-first — runs entirely on the user's machine; a remote/cloud execution plane is a future pluggable concern.</li>
         <li><strong>v1 delegated-agent set</strong>: just one external agent to start (Claude Code, via the existing <code>claude-agent-acp</code> adapter — no new ACP adapters are being built), to prove the architecture end-to-end before generalizing to Codex/Gemini CLI/Goose/OpenCode.</li>
+        <li><strong>Primary agent substitution</strong>: a third-party agent (e.g. Claude Code) can drive a session as the <em>primary/root</em> instead of lite-harness's own native loop, and still retains full delegate-to-other-harnesses power via an MCP tool bridge (<code>delegate_task</code>) — see <a href="architecture/index.html#primary">Architecture &sect;12</a>.</li>
       </ul>
     </div>
   </section>
