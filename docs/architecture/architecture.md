@@ -17,6 +17,8 @@ This document is the detailed architecture that follows from those decisions and
 
 **Addendum**: §12 adds one more capability — letting a third-party agent (e.g. Claude Code) act as the *primary/root* driver of a session instead of lite-harness's own native agent loop, while retaining full "spin up subagents in any other harness" delegation power even when the primary is itself delegated. It's a generalization of the session model and ACP module already defined in §3, §5, and §9, not a redesign of them.
 
+**Addendum**: §13 resolves the open question of which model providers the native agent loop supports — bring-your-own-key, provider-agnostic, with a configurable custom base URL, not hard-wired to a single vendor.
+
 ---
 
 ## 1. High-level component diagram
@@ -360,6 +362,47 @@ pub trait ChildRunner: Send + Sync {
 
 ---
 
+## 13. Native model provider configuration — BYO key, custom base URL
+
+**Requirement**: the native agent loop must not be hard-wired to a single vendor's API. Operators bring their own API key, and can point at a custom base URL — a self-hosted proxy, Azure OpenAI, OpenRouter, a local model server (Ollama, vLLM, LM Studio), or any other endpoint — not just the vendor's official one.
+
+### 13.1 Provider abstraction
+
+```rust
+#[async_trait]
+pub trait ModelProvider: Send + Sync {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponseStream>;
+    fn describe(&self) -> ModelProviderCapabilities; // tool-calling? streaming? vision? usage reporting?
+}
+```
+
+Two built-in protocol implementations cover the overwhelming majority of "custom base URL" targets in practice, rather than one bespoke integration per vendor:
+- `AnthropicProtocolProvider` — the Anthropic Messages API shape (native Anthropic API, or any Anthropic-compatible proxy).
+- `OpenAiCompatibleProvider` — the OpenAI Chat Completions API shape, which is the de facto standard almost every self-hosted/proxy/local model server also speaks (Ollama, vLLM, LM Studio, OpenRouter, Azure OpenAI, LiteLLM proxy, and others).
+
+### 13.2 Config shape
+
+```rust
+pub struct ModelProviderConfig {
+    pub name: String,                // user label, e.g. "anthropic", "openrouter", "local-llama"
+    pub protocol: ProviderProtocol,   // Anthropic | OpenAiCompatible
+    pub base_url: Url,                // overridable; defaults to the protocol's official endpoint
+    pub api_key_env: String,          // env var NAME the key is read from — never stored in the config file
+    pub default_model: String,
+    pub extra_headers: Option<HashMap<String, String>>, // e.g. Azure's api-version, a proxy's auth header
+}
+```
+
+Stored in `~/.config/lite-harness/providers.toml` (global) with an optional project-level override (`.lite-harness/providers.toml`) — the same layering convention already established for permission policy (§6). Multiple providers can be configured simultaneously; the active one for a session is chosen at `session/create` (defaulting to the config's marked default) or via a `--provider <name>` CLI flag, alongside the `--agent` flag from §12.5. The two flags are orthogonal: `--agent` picks *who* drives the session (native loop vs. a delegated ACP agent), `--provider` picks *which model backend* the native loop uses when it is the driver.
+
+**Security**: API keys are referenced by environment variable name (`api_key_env`), never written into the TOML config in plaintext — the daemon reads the env var at connection time. This keeps the config file itself from becoming a secret that needs separate protection/rotation.
+
+### 13.3 Cost ledger interaction
+
+Custom/self-hosted endpoints frequently can't be priced from a known table (§7's `ModelPricing`). Rather than guessing, `UsageDelta.confidence` degrades to `Unknown` exactly the way it already does for a delegated agent that doesn't report usage (§7) — the same honest-gap pattern, not a new special case: if `ModelPricing::lookup(provider, model)` has no entry, `cost_usd` is `None` and the ledger still records token counts (if the provider reports them) rather than fabricating a dollar figure.
+
+---
+
 ## 12. Primary agent substitution — any agent can drive the root session, and can itself delegate further
 
 **Requirement**: the user can choose Claude Code (or any other ACP-capable agent) as the *root/primary* driver of a session instead of lite-harness's native loop — and that substituted primary must retain the same "spin up subagents in other harnesses" capability the native loop has (§9).
@@ -480,8 +523,9 @@ lite-harness/
 │   ├── lh-permission             # PermissionEngine trait, DefaultPermissionEngine, policy model
 │   ├── lh-execution                # ExecutionPlane trait, LocalExecutionPlane (Landlock/Seatbelt)
 │   ├── lh-ledger                     # CostLedger rollup logic, UsageDelta, ModelPricing
-│   ├── lh-orchestration                # DelegationService — driver-neutral supervisor logic (§9, §12.3)
-│   ├── lh-native-agent                   # NativeAgentLoop, built-in tools (calls lh-orchestration to delegate)
+│   ├── lh-model-provider               # ModelProvider trait, Anthropic + OpenAI-compatible protocol impls (§13)
+│   ├── lh-orchestration                  # DelegationService — driver-neutral supervisor logic (§9, §12.3)
+│   ├── lh-native-agent                     # NativeAgentLoop — calls lh-orchestration to delegate, lh-model-provider for LLM calls
 │   ├── lh-mcp                              # MCP client integration for native tools — routes via lh-permission
 │   ├── lh-orchestration-mcp                  # MCP SERVER exposing delegate_task to any driving agent (§12.2)
 │   ├── lh-acp                                  # HarnessAcpClient, agent registry, DelegatedAgentAdapter
@@ -493,14 +537,14 @@ lite-harness/
 └── xtask/                                                  # dev tooling, integration harness w/ a fake ACP agent
 ```
 
-Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permission`, `lh-execution`, `lh-ledger` are independent siblings depending only on `lh-event`; `lh-orchestration` (the driver-neutral `DelegationService`, §12.3) depends on those plus `lh-event`; `lh-native-agent`, `lh-mcp`, `lh-orchestration-mcp`, and `lh-acp` all depend on `lh-orchestration` but not on each other — `lh-native-agent` calls delegation in-process, `lh-orchestration-mcp` exposes the identical capability to any out-of-process driving agent; `lh-daemon` is the only crate that constructs concrete implementations and wires trait objects together; `lh-cli`/`lh-web-backend` depend **only** on `lh-protocol` — a compile-time enforcement of "the UI is never load-bearing."
+Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permission`, `lh-execution`, `lh-ledger`, `lh-model-provider` are independent siblings depending only on `lh-event`; `lh-orchestration` (the driver-neutral `DelegationService`, §12.3) depends on those plus `lh-event`; `lh-native-agent`, `lh-mcp`, `lh-orchestration-mcp`, and `lh-acp` all depend on `lh-orchestration` but not on each other — `lh-native-agent` additionally depends on `lh-model-provider` (§13) for its own LLM calls, `lh-orchestration-mcp` exposes delegation to any out-of-process driving agent; `lh-daemon` is the only crate that constructs concrete implementations and wires trait objects together; `lh-cli`/`lh-web-backend` depend **only** on `lh-protocol` — a compile-time enforcement of "the UI is never load-bearing."
 
 ---
 
 ## 11. Build order / phasing
 
 1. **Skeleton & protocol plumbing** — `lh-event` types, `SqliteSessionStore`, `lh-protocol` framing, a daemon that echoes a hardcoded event stream, a CLI that connects and prints events. Proves the daemon+thin-client process model with zero agent logic.
-2. **Native agent loop, one real task, no sandbox yet** — single LLM provider, minimal built-in tools (read/write/edit/bash, initially unsandboxed and explicitly flagged as dev-only), `DefaultPermissionEngine` in `Ask`-only mode round-tripping through the daemon to the CLI.
+2. **Native agent loop, one real task, no sandbox yet** — `lh-model-provider` with the `ModelProvider` trait and both built-in protocol impls (Anthropic + OpenAI-compatible, §13) from the start, config-driven BYO-key + custom base URL (not hard-wired to one vendor even at this early phase), minimal built-in tools (read/write/edit/bash, initially unsandboxed and explicitly flagged as dev-only), `DefaultPermissionEngine` in `Ask`-only mode round-tripping through the daemon to the CLI.
 3. **Real sandboxing** — `LocalExecutionPlane` with Landlock (Linux first), policy persistence (`.lite-harness/policy.toml`), native cost ledger.
 4. **The ACP vertical slice — the architecture's actual proof point** — `lh-acp`, `HarnessAcpClient`, the Claude Code adapter, one delegated task end-to-end. The test that matters: **one permission-prompt path** handles both a native tool call and a Claude-Code-originated one, and the cost ledger shows one aggregated total across both. Everything after this phase is expansion, not new architecture.
 5. **Native subagents** — `ChildRunner`/`NativeSubagentRunner`, session-tree fork/resume. Should require touching `lh-permission`/`lh-ledger` not at all — itself a validation that those abstractions were shaped correctly.
@@ -521,6 +565,7 @@ Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permissio
 - `crates/lh-daemon/src/main.rs` — wires concrete `SessionStore`/`PermissionEngine`/`ExecutionPlane`/`ChildRunner` implementations together (§2, §10) — proof the whole architecture compiles as one system.
 - `crates/lh-orchestration/src/lib.rs` — `DelegationService`/`ChildRunner` (§9, §12.3) — the driver-neutral abstraction that lets both the native loop and `lh-orchestration-mcp` trigger delegation through one path.
 - `crates/lh-orchestration-mcp/src/lib.rs` — the `delegate_task` MCP server (§12.2) — the concrete bridge that lets an external primary agent (or, once opted in, a nested delegated child) request further delegation.
+- `crates/lh-model-provider/src/lib.rs` — `ModelProvider` trait, `AnthropicProtocolProvider`/`OpenAiCompatibleProvider` (§13) — what makes the native agent loop provider-agnostic (BYO key + custom base URL) from its very first implementation rather than hard-wired to one vendor.
 
 ---
 
@@ -528,6 +573,7 @@ Dependency direction: `lh-event` underlies everything; `lh-store`, `lh-permissio
 
 This phase produces a design document, not running code, so "verification" means: the plan is internally consistent and testable against the stated requirements before any Rust is written.
 
-- Cross-check §1-12 against the ten design principles from the research phase — confirm each principle maps to a concrete mechanism above, not just a restated goal. Spot checks: principle 5 → §6's `proof: &PermissionDecision` argument; principle 4 → §3's `SessionStore` trait; principle 1 → §3's `Event` as the sole state-changing primitive.
+- Cross-check §1-13 against the ten design principles from the research phase — confirm each principle maps to a concrete mechanism above, not just a restated goal. Spot checks: principle 5 → §6's `proof: &PermissionDecision` argument; principle 4 → §3's `SessionStore` trait; principle 1 → §3's `Event` as the sole state-changing primitive.
 - Once phases 1-4 above are implemented, the concrete acceptance test for "the architecture works" is: from the CLI, run one task that triggers both a native tool call and a delegated Claude Code tool call in the same session, see both permission prompts rendered identically (differing only in the displayed `ToolSource`), and see one `ledger/query` response with a combined cost total covering both.
 - Once phase 6 (§12) is implemented, the acceptance test for "primary substitution works" is: `lite-harness run --agent claude-code "<prompt>"` produces a root session whose `SessionDriverSet` says `Delegated(ClaudeCode)`, Claude Code successfully calls the `delegate_task` MCP tool mid-session, a child session is created through the exact same code path phase 4 already proved, and the resulting permission prompt / cost-ledger entry are indistinguishable in shape from a native-loop-initiated delegation.
+- Once phase 2 (§13) is implemented, the acceptance test for "provider configuration works" is: configure two providers in `~/.config/lite-harness/providers.toml` (e.g. an official Anthropic key and a local Ollama server with a custom `base_url`), run the same prompt with `--provider anthropic` and again with `--provider local-llama`, and confirm both complete via `lh-model-provider` with no code change — only config — and that the cost ledger shows a real dollar figure for the priced provider and an honest `Unknown`-confidence entry for the unpriced local one.

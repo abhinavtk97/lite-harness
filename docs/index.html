@@ -387,6 +387,7 @@
         <li><strong>Deployment model (v1)</strong>: local-first — runs entirely on the user's machine; a remote/cloud execution plane is a future pluggable concern.</li>
         <li><strong>v1 delegated-agent set</strong>: just one external agent to start (Claude Code, via the existing <code>claude-agent-acp</code> adapter — no new ACP adapters are being built), to prove the architecture end-to-end before generalizing to Codex/Gemini CLI/Goose/OpenCode.</li>
         <li><strong>Primary agent substitution</strong>: a third-party agent (e.g. Claude Code) can drive a session as the <em>primary/root</em> instead of lite-harness's own native loop, and still retains full delegate-to-other-harnesses power via an MCP tool bridge (<code>delegate_task</code>) — see <a href="architecture/index.html#primary">Architecture &sect;12</a>.</li>
+        <li><strong>Model providers</strong>: the native agent loop is provider-agnostic, bring-your-own-key, with a configurable custom base URL (self-hosted proxies, Azure OpenAI, OpenRouter, local model servers like Ollama/vLLM) — not hard-wired to a single vendor, from its very first implementation — see <a href="architecture/index.html#model-providers">Architecture &sect;13</a>.</li>
       </ul>
     </div>
   </section>
@@ -395,8 +396,8 @@
     <h2>Remaining open questions</h2>
     <div class="card">
       <ul>
-        <li>Which model providers must be supported at launch for the native agent loop — Anthropic-only, or provider-agnostic BYO-key from day one?</li>
         <li>Whether to swap the build-phasing order flagged as a judgment call on the <a href="architecture/index.html#phasing">Architecture page</a> (proving the ACP vertical slice early vs. maturing the native agent first).</li>
+        <li>Whether nested delegated agents get the <code>delegate_task</code> MCP tool by default, or only the primary driver does (flagged as a judgment call in <a href="architecture/index.html#primary">Architecture &sect;12.4</a>).</li>
         <li>Windows support timeline (out of scope for v1 per the current sandboxing design).</li>
       </ul>
     </div>
