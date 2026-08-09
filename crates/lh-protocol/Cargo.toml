@@ -1,0 +1,11 @@
+[package]
+name = "lh-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lh-event = { path = "../lh-event" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true

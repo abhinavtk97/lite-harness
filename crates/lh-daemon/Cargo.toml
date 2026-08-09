@@ -1,0 +1,18 @@
+[package]
+name = "lh-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lite-harnessd"
+path = "src/main.rs"
+
+[dependencies]
+lh-event = { path = "../lh-event" }
+lh-store = { path = "../lh-store" }
+lh-protocol = { path = "../lh-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
