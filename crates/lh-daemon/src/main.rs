@@ -22,7 +22,7 @@ use lh_native_agent::{AgentConfig, NativeAgentLoop};
 use lh_permission::{DefaultPermissionEngine, PermissionEngine, SessionPolicyStore, TomlPolicyStore};
 use lh_protocol::{
     buffered, default_socket_path, methods, read_message, write_message, InitializeResult,
-    LedgerQueryParams, LedgerQueryResult, Message, Notification, PermissionRespondParams,
+    LedgerQueryParams, LedgerQueryResult, Message, Notification, PermissionAskResult,
     Request as ProtoRequest, RequestId, Response, SessionCreateParams, SessionCreateResult,
     SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
 };
@@ -34,7 +34,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex as AsyncMutex;
 
-type SharedWriter = Arc<AsyncMutex<OwnedWriteHalf>>;
+pub(crate) type SharedWriter = Arc<AsyncMutex<OwnedWriteHalf>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -213,7 +213,7 @@ async fn handle_connection(
     // it rather than racing it for the writer lock.
     let forwarded_seq = spawn_event_forwarder(store.clone(), session_id, write_half.clone());
 
-    let prompter = SocketPrompter::new();
+    let prompter = SocketPrompter::new(write_half.clone());
     let permission_engine: Arc<dyn PermissionEngine> = Arc::new(DefaultPermissionEngine::with_policy_stores(
         Arc::new(prompter.clone()),
         Arc::new(SessionPolicyStore::new()),
@@ -240,16 +240,23 @@ async fn handle_connection(
                 )
                 .await?;
             }
-            Some(Message::Request(req)) if req.method == methods::PERMISSION_RESPOND => {
-                let params: PermissionRespondParams = serde_json::from_value(req.params)?;
-                prompter.resolve(params.decision).await;
-                respond(&write_half, req.id, serde_json::json!({})).await?;
-            }
             Some(Message::Request(req)) if req.method == methods::LEDGER_QUERY => {
                 let params: LedgerQueryParams = serde_json::from_value(req.params)?;
                 match cost_ledger.rollup(params.session_id).await {
                     Ok(rollup) => respond(&write_half, req.id, LedgerQueryResult { rollup }).await?,
                     Err(e) => respond_err(&write_half, req.id, e.to_string()).await?,
+                }
+            }
+            Some(Message::Response(resp)) => {
+                // The only Request the daemon ever sends *to* the client on
+                // this connection is permission/ask (SocketPrompter) -- any
+                // Response we get back is necessarily an answer to one of
+                // those.
+                match serde_json::from_value::<PermissionAskResult>(resp.result.unwrap_or_default()) {
+                    Ok(ask_result) => {
+                        prompter.resolve(resp.id, ask_result.decision).await;
+                    }
+                    Err(e) => eprintln!("[permission/ask response] failed to parse: {e}"),
                 }
             }
             Some(other) => {

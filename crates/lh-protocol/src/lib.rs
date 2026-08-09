@@ -120,7 +120,11 @@ pub mod methods {
     pub const SESSION_CREATE: &str = "session/create";
     pub const SESSION_PROMPT: &str = "session/prompt";
     pub const SESSION_TREE: &str = "session/tree";
-    pub const PERMISSION_RESPOND: &str = "permission/respond";
+    /// Daemon -> client request, sent only when a live human decision is
+    /// actually needed (i.e. the permission engine found no matching
+    /// policy rule) -- never for a policy-short-circuited decision. See
+    /// `PermissionAskParams`/`PermissionAskResult`.
+    pub const PERMISSION_ASK: &str = "permission/ask";
     pub const LEDGER_QUERY: &str = "ledger/query";
     /// Streamed daemon -> client notification carrying an `lh_event::Event`.
     pub const EVENT: &str = "event";
@@ -158,9 +162,19 @@ pub struct SessionPromptResult {
     pub stop_reason: String,
 }
 
+/// Params for a daemon-initiated `permission/ask` request. No `call_id`
+/// field -- `PermissionPrompter::ask()` never receives one (the agent loop
+/// tracks call ids separately for its own `PermissionRequested`/
+/// `PermissionDecided` events); correlation with the reply happens purely
+/// via the JSON-RPC request id, and the CLI's prompt only ever needed the
+/// `PermissionRequest` itself to render.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PermissionRespondParams {
-    pub call_id: String,
+pub struct PermissionAskParams {
+    pub request: lh_event::PermissionRequest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionAskResult {
     pub decision: lh_event::PermissionDecision,
 }
 
@@ -175,10 +189,15 @@ pub struct LedgerQueryResult {
 }
 
 // --- Newline-delimited JSON framing ---
+//
+// Generic over the serialized type so a second, ACP-specific JSON-RPC
+// envelope (`lh-acp`, architecture §5 -- ACP's `id` is untagged
+// null/number/string, unlike this protocol's `RequestId = i64`) can reuse
+// the exact same byte-level framing without duplicating it.
 
-pub async fn write_message<W: AsyncWrite + Unpin>(
+pub async fn write_json_line<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
-    msg: &Message,
+    msg: &T,
 ) -> std::io::Result<()> {
     let mut line = serde_json::to_string(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -187,10 +206,11 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     writer.flush().await
 }
 
-/// Reads one newline-delimited JSON message. Returns `Ok(None)` on clean EOF.
-pub async fn read_message<R: AsyncBufReadExt + Unpin>(
+/// Reads one newline-delimited JSON value. Returns `Ok(None)` on clean EOF
+/// or a blank line.
+pub async fn read_json_line<R: AsyncBufReadExt + Unpin, T: serde::de::DeserializeOwned>(
     reader: &mut R,
-) -> std::io::Result<Option<Message>> {
+) -> std::io::Result<Option<T>> {
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
@@ -203,6 +223,20 @@ pub async fn read_message<R: AsyncBufReadExt + Unpin>(
     let msg = serde_json::from_str(trimmed)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(Some(msg))
+}
+
+pub async fn write_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    msg: &Message,
+) -> std::io::Result<()> {
+    write_json_line(writer, msg).await
+}
+
+/// Reads one newline-delimited JSON message. Returns `Ok(None)` on clean EOF.
+pub async fn read_message<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Message>> {
+    read_json_line(reader).await
 }
 
 /// Convenience: wrap a raw async reader in a line-buffered reader.
@@ -254,6 +288,62 @@ mod tests {
             }
             other => panic!("expected Request, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn permission_ask_round_trips_with_a_negative_daemon_originated_id() {
+        // Daemon-initiated request ids are negative (client ids start at 1
+        // and only increment) so the two id spaces can never collide on
+        // the same connection -- RequestId = i64 needs no special-casing
+        // for that, which this test pins down.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut server = buffered(server);
+
+        let request = lh_event::PermissionRequest {
+            session_id: lh_event::SessionId::now_v7(),
+            tool_source: lh_event::ToolSource::Native {
+                tool_id: "bash".to_string(),
+            },
+            action: lh_event::PermissionAction::Exec {
+                command: "ls".to_string(),
+                args: vec![],
+                cwd: std::path::PathBuf::from("."),
+            },
+            risk_tier: lh_event::RiskTier::Execute,
+        };
+        let ask = Message::Request(Request::new(
+            -1,
+            methods::PERMISSION_ASK,
+            serde_json::to_value(PermissionAskParams { request }).unwrap(),
+        ));
+        write_message(&mut client, &ask).await.unwrap();
+
+        let got = read_message(&mut server).await.unwrap().unwrap();
+        let Message::Request(r) = got else {
+            panic!("expected Request, got {got:?}");
+        };
+        assert_eq!(r.id, -1);
+        assert_eq!(r.method, methods::PERMISSION_ASK);
+        let params: PermissionAskParams = serde_json::from_value(r.params).unwrap();
+        assert_eq!(params.request.risk_tier, lh_event::RiskTier::Execute);
+
+        let reply = Message::Response(Response::ok(
+            r.id,
+            serde_json::to_value(PermissionAskResult {
+                decision: lh_event::PermissionDecision::Allow,
+            })
+            .unwrap(),
+        ));
+        write_message(&mut server, &reply).await.unwrap();
+
+        let mut client = buffered(client);
+        let got = read_message(&mut client).await.unwrap().unwrap();
+        let Message::Response(resp) = got else {
+            panic!("expected Response, got {got:?}");
+        };
+        assert_eq!(resp.id, -1);
+        let result: PermissionAskResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(matches!(result.decision, lh_event::PermissionDecision::Allow));
     }
 
     #[test]

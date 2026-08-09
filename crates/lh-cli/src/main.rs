@@ -14,9 +14,9 @@ use anyhow::{anyhow, Context, Result};
 use lh_event::{ContentBlock, Event, EventPayload, PermissionDecision};
 use lh_protocol::{
     buffered, default_socket_path, methods, read_message, write_message, InitializeParams,
-    InitializeResult, LedgerQueryParams, LedgerQueryResult, Message, PermissionRespondParams,
-    Request, RequestId, SessionCreateParams, SessionCreateResult, SessionPromptParams,
-    SessionPromptResult, PROTOCOL_VERSION,
+    InitializeResult, LedgerQueryParams, LedgerQueryResult, Message, PermissionAskParams,
+    PermissionAskResult, Request, RequestId, Response, SessionCreateParams, SessionCreateResult,
+    SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tokio::net::UnixStream;
@@ -78,26 +78,21 @@ async fn main() -> Result<()> {
             Some(Message::Notification(n)) if n.method == methods::EVENT => {
                 let event: Event = serde_json::from_value(n.params)?;
                 print_event(&event);
-
-                if let EventPayload::PermissionRequested { call_id, request: perm_req } =
-                    &event.payload
-                {
-                    let decision = ask_for_decision(&mut stdin, perm_req).await?;
-                    let respond_id = next_id;
-                    next_id += 1;
-                    write_message(
-                        &mut write_half,
-                        &Message::Request(Request::new(
-                            respond_id,
-                            methods::PERMISSION_RESPOND,
-                            serde_json::to_value(PermissionRespondParams {
-                                call_id: call_id.clone(),
-                                decision,
-                            })?,
-                        )),
-                    )
-                    .await?;
-                }
+            }
+            Some(Message::Request(req)) if req.method == methods::PERMISSION_ASK => {
+                // The daemon only ever sends this when a live human
+                // decision is genuinely needed -- a policy-resolved
+                // decision never reaches here at all.
+                let params: PermissionAskParams = serde_json::from_value(req.params)?;
+                let decision = ask_for_decision(&mut stdin, &params.request).await?;
+                write_message(
+                    &mut write_half,
+                    &Message::Response(Response::ok(
+                        req.id,
+                        serde_json::to_value(PermissionAskResult { decision })?,
+                    )),
+                )
+                .await?;
             }
             Some(Message::Response(resp)) if resp.id == prompt_id => {
                 if let Some(err) = resp.error {
@@ -220,15 +215,6 @@ async fn ask_for_decision(
         request.tool_source,
         describe_action(&request.action)
     );
-    // Note: this prompt fires for every PermissionRequested event, even
-    // one the daemon already auto-resolved via a stored policy rule
-    // (architecture §6) -- the CLI can't yet distinguish "the daemon is
-    // waiting on me" from "already decided, this is just the audit log
-    // catching up" without a dedicated ask/reply round-trip. Answering
-    // here in that case is a harmless no-op (nothing is pending on the
-    // daemon side to resolve), but it's a known rough edge, not settled
-    // behavior -- flagged for a follow-up protocol change, not silently
-    // relied upon.
     print!("  allow? [y/N/a=always-allow/d=always-deny]: ");
     std::io::stdout().flush().ok();
 
