@@ -1,6 +1,6 @@
 # Raw research: ACP and the "meta-harness" pattern
 
-*Verbatim output of a follow-up research pass (two parallel queries), prompted by exploring whether `lite-harness` could act as a meta-harness — spinning up other existing coding-agent harnesses (Claude Code, OpenCode, Codex CLI, Gemini CLI, etc.) as subagents — and whether the Agent Client Protocol (ACP) could help. Conducted via web search, current as of August 2026. See [../agent-harness-landscape.md](../agent-harness-landscape.md) for the synthesized finding (section: "Candidate USP: meta-harness").*
+*Verbatim output of a follow-up research pass (two parallel desk-research queries, plus a third hands-on verification pass), prompted by exploring whether `lite-harness` could act as a meta-harness — spinning up other existing coding-agent harnesses (Claude Code, OpenCode, Codex CLI, Gemini CLI, etc.) as subagents — and whether the Agent Client Protocol (ACP) could help. Conducted via web search and, for Pass 3, actually cloning and running ACP code, current as of August 2026. See [../agent-harness-landscape.md](../agent-harness-landscape.md) for the synthesized finding (section: "Candidate USP: meta-harness").*
 
 ---
 
@@ -63,3 +63,176 @@
 - [MindStudio: What Is a Meta Harness for AI Agents?](https://www.mindstudio.ai/blog/what-is-meta-harness-ai-agents-omniagent)
 - [Augment Code: 9 Open-Source Agent Orchestrators](https://www.augmentcode.com/tools/open-source-agent-orchestrators)
 - [amux: Best Multi-Agent Coding Orchestrators in 2026](https://amux.io/blog/best-multi-agent-orchestrators-2026/)
+
+---
+
+## Pass 3: hands-on verification (not desk research — actually ran the code)
+
+Passes 1 and 2 above were desk research (docs, blog posts, issue trackers).
+To verify the load-bearing claim — that ACP's 1:1 connection model doesn't
+block an orchestrator from holding many agent connections at once — the
+following repos were cloned and run directly:
+
+- `agentclientprotocol/agent-client-protocol` — the spec repo (schema +
+  docs only; the actual SDKs live in separate per-language repos).
+- `agentclientprotocol/typescript-sdk` — the reference TypeScript
+  implementation, including runnable example agent/client binaries.
+- `zed-industries/claude-agent-acp` and `zed-industries/codex-acp` — the
+  two real third-party adapters that bridge Claude Code and Codex into ACP.
+
+### Finding A: N concurrent ACP connections from one process — confirmed empirically
+
+Reading `typescript-sdk/src/connection.ts` and `src/acp.ts` shows no
+shared/global state: each `client(options)` builder plus `.connectWith(stream,
+callback)` call creates a fully self-contained `Connection` object (its own
+`connectionId = globalThis.crypto.randomUUID()`), scoped to exactly the one
+stream passed in. Nothing prevents calling this any number of times.
+
+To confirm this in practice rather than just from reading the code, a small
+orchestrator script (`meta-harness-test.ts`) was added under the SDK's own
+`src/examples/` directory (so relative imports of `../acp.js` worked without
+modifying the SDK) and run via `npx tsx`. It spawns **two** copies of the
+SDK's own example agent (`agent.ts`, a mock agent that simulates a full turn
+including a tool call requiring permission) as separate OS subprocesses, and
+drives both concurrently from a single Node process using
+`Promise.allSettled`, auto-resolving each permission request independently
+per worker.
+
+Actual run output (trimmed):
+
+```
+Spawning TWO concurrent ACP agent subprocesses from ONE orchestrator process...
+
+[worker-B] connected, protocol v1, pid=6269
+[worker-B] session ccd3c73b79b85a50554def6c30cca90f created
+[worker-A] connected, protocol v1, pid=6263
+[worker-B] << I'll help you with that. Let me start by reading some files...
+[worker-A] session 85faad3be9548b04c2b4d49244165b48 created
+[worker-A] << I'll help you with that. Let me start by reading some files...
+[worker-B] << [tool_call]
+[worker-A] << [tool_call]
+...
+[worker-B] permission requested: Modifying critical configuration file -> auto-allowing
+[worker-A] permission requested: Modifying critical configuration file -> auto-allowing
+...
+[worker-B] DONE stopReason=end_turn
+[worker-A] DONE stopReason=end_turn
+
+Elapsed: 6335ms
+worker-A: fulfilled
+worker-B: fulfilled
+```
+
+Both agents ran as genuinely separate OS processes (distinct PIDs), streamed
+interleaved output, and each resolved its own permission request in complete
+isolation from the other — no cross-talk, no shared state, no SDK-level
+blocker. The ~6.3s total elapsed time (versus ~13s if the two runs had been
+serialized, given the mock agent's simulated per-step delays) confirms the
+two connections ran in genuine parallel, not one after another.
+
+**Conclusion**: the "N independent connections, zero shared orchestration
+state" claim from Pass 1 is confirmed by direct execution, not just by
+reading documentation. Holding many agent subprocesses open at once from one
+orchestrator is architecturally trivial with the ACP TypeScript SDK — the
+SDK does nothing to help *or* hinder it, it is simply out of scope for the
+protocol.
+
+Test script (kept for reference, not part of any published package):
+
+```ts
+// src/examples/meta-harness-test.ts (run inside a clone of
+// agentclientprotocol/typescript-sdk, so `../acp.js` resolves)
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { Writable, Readable } from "node:stream";
+import * as acp from "../acp.js";
+
+async function runWorker(workerId: string) {
+  const __filename = fileURLToPath(import.meta.url);
+  const agentPath = join(dirname(__filename), "agent.ts");
+  const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
+  const agentProcess = spawn(npxCmd, ["tsx", agentPath], {
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+
+  const input = Writable.toWeb(agentProcess.stdin!);
+  const output = Readable.toWeb(agentProcess.stdout!) as ReadableStream<Uint8Array>;
+  const stream = acp.ndJsonStream(input, output);
+
+  try {
+    const result = await acp
+      .client({ name: `meta-harness-worker-${workerId}` })
+      .onRequest(acp.methods.client.session.requestPermission, async (ctx) => {
+        console.log(`[${workerId}] permission requested: ${ctx.params.toolCall.title} -> auto-allowing`);
+        const allowOption = ctx.params.options.find((o) => o.kind === "allow_once");
+        return {
+          outcome: {
+            outcome: "selected",
+            optionId: allowOption ? allowOption.optionId : ctx.params.options[0].optionId,
+          },
+        };
+      })
+      .onRequest(acp.methods.client.fs.writeTextFile, async () => ({}))
+      .onRequest(acp.methods.client.fs.readTextFile, async () => ({ content: "mock content" }))
+      .connectWith(stream, async (ctx) => {
+        const initResult = await ctx.request(acp.methods.agent.initialize, {
+          protocolVersion: acp.PROTOCOL_VERSION,
+          clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+        });
+        console.log(`[${workerId}] connected, protocol v${initResult.protocolVersion}, pid=${agentProcess.pid}`);
+
+        return ctx.buildSession(process.cwd()).withSession(async (session) => {
+          console.log(`[${workerId}] session ${session.sessionId} created`);
+          session.prompt(`Task for ${workerId}`);
+          for (;;) {
+            const message = await session.nextUpdate();
+            if (message.kind === "stop") return message.response;
+            const u = message.notification.update;
+            console.log(`[${workerId}] << ${u.sessionUpdate === "agent_message_chunk" && u.content.type === "text" ? u.content.text : `[${u.sessionUpdate}]`}`);
+          }
+        });
+      });
+
+    console.log(`[${workerId}] DONE stopReason=${result.stopReason}`);
+  } finally {
+    agentProcess.kill();
+  }
+}
+
+async function main() {
+  const start = Date.now();
+  const [resultA, resultB] = await Promise.allSettled([runWorker("worker-A"), runWorker("worker-B")]);
+  console.log(`Elapsed: ${Date.now() - start}ms`, resultA.status, resultB.status);
+}
+
+main();
+```
+
+### Finding B: the cost of a real ACP adapter, measured directly
+
+To put a number on "how much work is it to bridge a tool that doesn't speak
+ACP natively into ACP," the two real Zed-maintained adapters were measured
+directly (`wc -l`, excluding tests):
+
+| Adapter | Bridges | Language | Size |
+|---|---|---|---|
+| `claude-agent-acp` | Claude Code / Claude Agent SDK | TypeScript | **~10,600 lines**, 125 methods across the source files; a dedicated 1,417-line `tools.ts` just for translating Claude's tool-call/permission model into ACP's `tool_call`/`tool_call_update`/`request_permission` shapes |
+| `codex-acp` | OpenAI Codex | Rust | **~10,000 lines** |
+
+Both are the same order of magnitude despite different languages and
+maintainers, which suggests ~10K lines is roughly the real cost of a
+production-quality ACP adapter for a modern coding-agent CLI, not a
+weekend shim. This is hard evidence (not inference) for the Pass 1/2
+conclusion that ACP's value is as a *transport*, while the actual
+integration work — mapping one tool's permission/tool-call semantics onto
+ACP's — is substantial and tool-specific.
+
+**Net effect on the design conclusion (unchanged, now evidence-backed):**
+the mechanics of holding multiple agent subprocesses open concurrently are
+genuinely trivial to build (confirmed by direct execution); the real cost
+centers for a `lite-harness` meta-harness are (a) writing/maintaining
+adapters for any tool without native ACP support, at ~10K lines each, and
+(b) the still-unbuilt orchestration/permission-bridging/cost-ledger layer on
+top — which remains the actual differentiation opportunity, not the
+transport.

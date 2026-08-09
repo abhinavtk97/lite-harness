@@ -334,10 +334,11 @@ Follow-up research, prompted by exploring a potential differentiator: could
 harnesses (Claude Code, OpenCode, Codex CLI, Gemini CLI, etc.) as subagents,
 rather than only spawning homogeneous subagents of itself? And specifically,
 can the Agent Client Protocol (ACP) — Zed Industries' JSON-RPC protocol for
-editor↔agent communication — help build this? Full raw findings:
-[acp-and-meta-harness.md](raw/acp-and-meta-harness.md).
+editor↔agent communication — help build this? Full raw findings, including a
+hands-on verification pass (cloned and ran real ACP code, not just desk
+research): [acp-and-meta-harness.md](raw/acp-and-meta-harness.md).
 
-**Findings (Aug 2026, via two research passes):**
+**Findings (Aug 2026, via two desk-research passes plus a hands-on pass):**
 
 - **ACP is a usable transport, not an orchestration layer.** It's strictly a
   1:1 client↔agent JSON-RPC protocol (mostly stdio) with a genuinely rich
@@ -367,6 +368,17 @@ editor↔agent communication — help build this? Full raw findings:
   cross-vendor billing/cost reconciliation and permission-model bridging.
   Nobody has done this cleanly yet — every project punts on it or leaves it
   manual.
+- **Hands-on verification, not just desk research**: cloned
+  `agentclientprotocol/typescript-sdk` and wrote a small orchestrator script
+  that spawns two agent subprocesses and drives both concurrently from one
+  process. Confirmed by an actual run: two separate OS processes, fully
+  interleaved streaming output, each resolving its own permission request in
+  isolation, completing in ~6.3s (vs. ~13s if serialized) — genuine
+  parallelism, no shared state, no SDK-level blocker. Separately measured
+  the two real third-party adapters directly: `claude-agent-acp`
+  (~10,600 lines) and `codex-acp` (~10,000 lines) — confirming a production
+  ACP adapter for a tool without native support is a real, ~10K-line
+  engineering effort, not a thin shim.
 
 **Conclusion**: the orchestration mechanics of "spawn Claude Code / Codex /
 Gemini CLI as a worker" are not themselves the differentiator — several
