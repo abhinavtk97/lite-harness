@@ -1,12 +1,13 @@
-//! `lite-harnessd` (architecture §2, §11 phases 2-3).
+//! `lite-harnessd` (architecture §2, §11 phases 2-4).
 //!
 //! Listens on a per-workspace Unix domain socket, speaks the Harness
 //! Protocol, and runs a real native agent loop on `session/prompt`: calls a
 //! configured `ModelProvider`, gates every tool call through a
 //! `PermissionEngine` that round-trips permission asks back to whichever
 //! client is attached, executes allowed tool calls through a sandboxed
-//! `ExecutionPlane`, and streams every step out as `Event`s. No ACP/
-//! delegation yet (Phase 4+).
+//! `ExecutionPlane`, and streams every step out as `Event`s.
+//! `session/delegate` hands one task to an external ACP-speaking agent
+//! (`lh-acp`) as a child session, through the exact same permission engine.
 
 mod permission;
 mod providers;
@@ -15,7 +16,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{ensure, Result};
-use lh_event::{Actor, Event, EventPayload, SessionDriver};
+use lh_acp::{registry::AgentsFile, DelegatedAgentAdapter};
+use lh_event::{Actor, Event, EventPayload, SessionDriver, SessionId};
 use lh_execution::{ExecutionPlane, LocalExecutionPlane};
 use lh_ledger::{CostLedger, PricingTable, StoreBackedCostLedger};
 use lh_native_agent::{AgentConfig, NativeAgentLoop};
@@ -24,7 +26,8 @@ use lh_protocol::{
     buffered, default_socket_path, methods, read_message, write_message, InitializeResult,
     LedgerQueryParams, LedgerQueryResult, Message, Notification, PermissionAskResult,
     Request as ProtoRequest, RequestId, Response, SessionCreateParams, SessionCreateResult,
-    SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
+    SessionDelegateParams, SessionDelegateResult, SessionPromptParams, SessionPromptResult,
+    PROTOCOL_VERSION,
 };
 use lh_store::{SessionStore, SqliteSessionStore};
 use permission::SocketPrompter;
@@ -124,6 +127,25 @@ async fn main() -> Result<()> {
 
     let cost_ledger: Arc<dyn CostLedger> = Arc::new(StoreBackedCostLedger::new(store.clone()));
 
+    // Delegated-agent registry (architecture §5.2, §11 phase 4): mirrors
+    // providers.toml/policy.toml's load-and-log-don't-crash convention --
+    // no configured agents just means session/delegate errors per-request,
+    // not a daemon startup failure.
+    let agents_registry = match lh_acp::registry::agents_path() {
+        Some(path) => match lh_acp::registry::load_agents_file(&path) {
+            Ok(file) => {
+                eprintln!("agent registry ready ({} adapter(s) from {})", file.agents.len(), path.display());
+                file
+            }
+            Err(e) => {
+                eprintln!("failed to load agent registry at {}: {e:#}", path.display());
+                AgentsFile::default()
+            }
+        },
+        None => AgentsFile::default(),
+    };
+    let agents_registry = Arc::new(agents_registry);
+
     loop {
         let (stream, _addr) = listener.accept().await?;
         let store = store.clone();
@@ -133,6 +155,7 @@ async fn main() -> Result<()> {
         let global_policy = global_policy.clone();
         let pricing = pricing.clone();
         let cost_ledger = cost_ledger.clone();
+        let agents_registry = agents_registry.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 stream,
@@ -143,6 +166,7 @@ async fn main() -> Result<()> {
                 global_policy,
                 pricing,
                 cost_ledger,
+                agents_registry,
             )
             .await
             {
@@ -162,6 +186,7 @@ async fn handle_connection(
     global_policy: Option<Arc<TomlPolicyStore>>,
     pricing: Arc<PricingTable>,
     cost_ledger: Arc<dyn CostLedger>,
+    agents_registry: Arc<AgentsFile>,
 ) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = buffered(read_half);
@@ -246,6 +271,20 @@ async fn handle_connection(
                     Ok(rollup) => respond(&write_half, req.id, LedgerQueryResult { rollup }).await?,
                     Err(e) => respond_err(&write_half, req.id, e.to_string()).await?,
                 }
+            }
+            Some(Message::Request(req)) if req.method == methods::SESSION_DELEGATE => {
+                handle_session_delegate(
+                    req,
+                    session_id,
+                    &workspace_root,
+                    &store,
+                    &permission_engine,
+                    &execution_plane,
+                    &agents_registry,
+                    &write_half,
+                    forwarded_seq.clone(),
+                )
+                .await?;
             }
             Some(Message::Response(resp)) => {
                 // The only Request the daemon ever sends *to* the client on
@@ -346,11 +385,106 @@ async fn handle_session_prompt(
     Ok(())
 }
 
-/// Forwards every event appended for `session_id` to this connection's
-/// socket, in the order the store assigned them. Returns a watch channel
-/// reporting the highest `seq` actually written so far, so other tasks on
-/// this connection (namely the session/prompt response) can wait for the
-/// forwarder to catch up instead of racing it for the writer lock.
+/// Delegates one task to an external ACP agent as a child of `session_id`
+/// (architecture §5, §11 phase 4) -- structurally identical to
+/// `handle_session_prompt`: runs in its own task so this connection's read
+/// loop stays free to answer inbound `permission/ask` replies while the
+/// agent subprocess is running, and waits for the event forwarder to catch
+/// up before sending the final response, for the same ordering reason.
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_delegate(
+    req: ProtoRequest,
+    parent_session_id: SessionId,
+    workspace_root: &std::path::Path,
+    store: &Arc<dyn SessionStore>,
+    permission_engine: &Arc<dyn PermissionEngine>,
+    execution_plane: &Arc<dyn ExecutionPlane>,
+    agents_registry: &Arc<AgentsFile>,
+    write_half: &SharedWriter,
+    forwarded_seq: tokio::sync::watch::Receiver<Option<u64>>,
+) -> Result<()> {
+    let params: SessionDelegateParams = serde_json::from_value(req.params)?;
+
+    let Some(adapter) = agents_registry.find(&params.agent) else {
+        respond_err(
+            write_half,
+            req.id,
+            format!(
+                "no delegated agent adapter configured for {:?} (see LITE_HARNESS_AGENTS_FILE)",
+                params.agent
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+    let adapter: DelegatedAgentAdapter = adapter.clone();
+    let child_session_id = SessionId::now_v7();
+
+    let write_half = write_half.clone();
+    let store = store.clone();
+    let permission_engine = permission_engine.clone();
+    let execution_plane = execution_plane.clone();
+    let workspace_root = workspace_root.to_path_buf();
+    let req_id = req.id;
+    let mut forwarded_seq = forwarded_seq;
+    tokio::spawn(async move {
+        let outcome = lh_acp::delegate::run_delegation(
+            parent_session_id,
+            child_session_id,
+            &workspace_root,
+            &adapter,
+            &params.task_summary,
+            store.clone(),
+            permission_engine,
+            execution_plane,
+        )
+        .await;
+
+        if let Ok(target_seq) = store.latest_seq(parent_session_id).await {
+            while forwarded_seq.borrow().unwrap_or(0) < target_seq {
+                if forwarded_seq.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        let msg = match outcome {
+            Ok(outcome) => Message::Response(Response::ok(
+                req_id,
+                serde_json::to_value(SessionDelegateResult { child_session_id, outcome })
+                    .expect("SessionDelegateResult always serializes"),
+            )),
+            Err(e) => Message::Response(Response::err(req_id, 1, e.to_string())),
+        };
+        let mut w = write_half.lock().await;
+        let _ = write_message(&mut *w, &msg).await;
+    });
+
+    Ok(())
+}
+
+/// Forwards every event appended for `session_id` *or one of its
+/// descendants* (a delegated ACP agent's child session, §11 phase 4) to
+/// this connection's socket, in the order the store assigned them -- so
+/// the client sees a delegation's tool calls/messages live, not just the
+/// final `session/delegate` response. Descendants are discovered
+/// dynamically: only a session's *first* event conventionally carries
+/// `parent_session_id` (the same convention `SqliteSessionStore::
+/// session_tree` relies on), so this tracks tree membership itself by
+/// watching for `ChildSessionSpawned` events on any session already known
+/// to be in the tree, rather than trusting every individual event's own
+/// `parent_session_id` field.
+///
+/// Returns a watch channel reporting the highest `seq` actually written so
+/// far *for `session_id` itself*, so other tasks on this connection (the
+/// session/prompt and session/delegate responses) can wait for the
+/// forwarder to catch up instead of racing it for the writer lock. Scoping
+/// the watch value to the root session only (not descendants) is
+/// deliberate and still correct: a delegation's own
+/// `ChildSessionSpawned`/`ChildSessionEnded` events are appended to the
+/// *root*, strictly after every one of the child's own events (the same
+/// task appends them sequentially), so by the time the root's own target
+/// seq is forwarded, every relevant descendant event already was too.
 fn spawn_event_forwarder(
     store: Arc<dyn SessionStore>,
     session_id: lh_event::SessionId,
@@ -359,9 +493,15 @@ fn spawn_event_forwarder(
     let (forwarded_tx, forwarded_rx) = tokio::sync::watch::channel(None);
     let mut rx = store.subscribe();
     tokio::spawn(async move {
+        let mut tree: std::collections::HashSet<lh_event::SessionId> =
+            std::collections::HashSet::from([session_id]);
         loop {
             match rx.recv().await {
-                Ok(event) if event.session_id == session_id => {
+                Ok(event) if tree.contains(&event.session_id) => {
+                    if let EventPayload::ChildSessionSpawned { child, .. } = &event.payload {
+                        tree.insert(*child);
+                    }
+                    let is_root = event.session_id == session_id;
                     let seq = event.seq;
                     let notif = Message::Notification(Notification::new(
                         methods::EVENT,
@@ -372,7 +512,9 @@ fn spawn_event_forwarder(
                         break;
                     }
                     drop(w);
-                    let _ = forwarded_tx.send(Some(seq));
+                    if is_root {
+                        let _ = forwarded_tx.send(Some(seq));
+                    }
                 }
                 Ok(_other_session) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

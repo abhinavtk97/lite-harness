@@ -126,6 +126,12 @@ pub mod methods {
     /// `PermissionAskParams`/`PermissionAskResult`.
     pub const PERMISSION_ASK: &str = "permission/ask";
     pub const LEDGER_QUERY: &str = "ledger/query";
+    /// Delegates one task to an external ACP-speaking agent as a child
+    /// session of the caller's session (architecture §5, §11 phase 4).
+    /// Root-session substitution (an ACP agent driving the *root*, not a
+    /// child) is `PrimarySelector` at `session/create`, Phase 6/§12 -- not
+    /// this method.
+    pub const SESSION_DELEGATE: &str = "session/delegate";
     /// Streamed daemon -> client notification carrying an `lh_event::Event`.
     pub const EVENT: &str = "event";
 }
@@ -186,6 +192,18 @@ pub struct LedgerQueryParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerQueryResult {
     pub rollup: lh_ledger::LedgerRollup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDelegateParams {
+    pub agent: lh_event::AgentKind,
+    pub task_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDelegateResult {
+    pub child_session_id: lh_event::SessionId,
+    pub outcome: lh_event::ChildOutcome,
 }
 
 // --- Newline-delimited JSON framing ---

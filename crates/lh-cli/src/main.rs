@@ -11,21 +11,44 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use lh_event::{ContentBlock, Event, EventPayload, PermissionDecision};
+use lh_event::{AgentKind, ContentBlock, Event, EventPayload, PermissionDecision};
 use lh_protocol::{
     buffered, default_socket_path, methods, read_message, write_message, InitializeParams,
     InitializeResult, LedgerQueryParams, LedgerQueryResult, Message, PermissionAskParams,
     PermissionAskResult, Request, RequestId, Response, SessionCreateParams, SessionCreateResult,
-    SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
+    SessionDelegateParams, SessionDelegateResult, SessionPromptParams, SessionPromptResult,
+    PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tokio::net::UnixStream;
 
+/// `lite-harness [--agent claude-code] <prompt>` -- omitting `--agent`
+/// keeps today's default (native loop, `session/prompt`); naming an agent
+/// sends `session/delegate` instead (architecture §11 phase 4). Just this
+/// one flag for v1, matching the single delegated-agent-set decision.
+fn parse_args() -> Result<(Option<AgentKind>, String)> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let usage = "usage: lite-harness [--agent claude-code] <prompt>\n  \
+        e.g. lite-harness \"list the files in this directory\"\n  \
+        e.g. lite-harness --agent claude-code \"fix the failing test\"";
+
+    if args.first().map(String::as_str) == Some("--agent") {
+        let name = args.get(1).ok_or_else(|| anyhow!("{usage}\n\n--agent requires a value"))?;
+        let agent = match name.as_str() {
+            "claude-code" => AgentKind::ClaudeCode,
+            other => anyhow::bail!("{usage}\n\nunknown agent '{other}' (only 'claude-code' is supported today)"),
+        };
+        let prompt = args.get(2).ok_or_else(|| anyhow!("{usage}"))?.clone();
+        Ok((Some(agent), prompt))
+    } else {
+        let prompt = args.first().ok_or_else(|| anyhow!("{usage}"))?.clone();
+        Ok((None, prompt))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let prompt = std::env::args().nth(1).ok_or_else(|| {
-        anyhow!("usage: lite-harness <prompt>\n  e.g. lite-harness \"list the files in this directory\"")
-    })?;
+    let (agent, prompt) = parse_args()?;
 
     let cwd = std::env::current_dir()?;
     let sock_path = default_socket_path(&cwd);
@@ -61,15 +84,34 @@ async fn main() -> Result<()> {
 
     let prompt_id = next_id;
     next_id += 1;
-    write_message(
-        &mut write_half,
-        &Message::Request(Request::new(
-            prompt_id,
-            methods::SESSION_PROMPT,
-            serde_json::to_value(SessionPromptParams { text: prompt })?,
-        )),
-    )
-    .await?;
+    match &agent {
+        None => {
+            write_message(
+                &mut write_half,
+                &Message::Request(Request::new(
+                    prompt_id,
+                    methods::SESSION_PROMPT,
+                    serde_json::to_value(SessionPromptParams { text: prompt })?,
+                )),
+            )
+            .await?;
+        }
+        Some(agent) => {
+            eprintln!("delegating to {agent:?}\n");
+            write_message(
+                &mut write_half,
+                &Message::Request(Request::new(
+                    prompt_id,
+                    methods::SESSION_DELEGATE,
+                    serde_json::to_value(SessionDelegateParams {
+                        agent: agent.clone(),
+                        task_summary: prompt,
+                    })?,
+                )),
+            )
+            .await?;
+        }
+    }
 
     let mut stdin = buffered(tokio::io::stdin());
 
@@ -97,28 +139,38 @@ async fn main() -> Result<()> {
             Some(Message::Response(resp)) if resp.id == prompt_id => {
                 if let Some(err) = resp.error {
                     eprintln!("\n[turn failed] {}", err.message);
+                } else if agent.is_some() {
+                    let result: SessionDelegateResult =
+                        serde_json::from_value(resp.result.unwrap_or_default())?;
+                    println!(
+                        "\n[delegation complete: child session {}, outcome: {:?}]",
+                        result.child_session_id, result.outcome
+                    );
                 } else {
                     let result: SessionPromptResult =
                         serde_json::from_value(resp.result.unwrap_or_default())?;
                     println!("\n[turn complete: {}]", result.stop_reason);
+                }
 
-                    match request::<LedgerQueryResult>(
-                        &mut write_half,
-                        &mut reader,
-                        &mut next_id,
-                        methods::LEDGER_QUERY,
-                        serde_json::to_value(LedgerQueryParams { session_id: create_result.session_id })?,
-                    )
-                    .await
-                    {
-                        Ok(ledger) => print_ledger(&ledger.rollup, 0),
-                        Err(e) => eprintln!("[ledger/query failed] {e}"),
-                    }
+                match request::<LedgerQueryResult>(
+                    &mut write_half,
+                    &mut reader,
+                    &mut next_id,
+                    methods::LEDGER_QUERY,
+                    serde_json::to_value(LedgerQueryParams { session_id: create_result.session_id })?,
+                )
+                .await
+                {
+                    Ok(ledger) => print_ledger(&ledger.rollup, 0),
+                    Err(e) => eprintln!("[ledger/query failed] {e}"),
                 }
                 break;
             }
             Some(Message::Response(_)) => {
-                // Almost certainly the ack for our permission/respond request.
+                // Almost certainly the ack for our ledger/query request
+                // (its own response is matched directly inside `request()`,
+                // not here) -- nothing else on this connection sends the
+                // CLI an unsolicited Response.
             }
             Some(other) => {
                 eprintln!("[unexpected message] {other:?}");

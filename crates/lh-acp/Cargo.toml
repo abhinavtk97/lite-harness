@@ -1,25 +1,22 @@
 [package]
-name = "lh-daemon"
+name = "lh-acp"
 version.workspace = true
 edition.workspace = true
-
-[[bin]]
-name = "lite-harnessd"
-path = "src/main.rs"
 
 [dependencies]
 lh-event = { path = "../lh-event" }
 lh-store = { path = "../lh-store" }
-lh-protocol = { path = "../lh-protocol" }
-lh-model-provider = { path = "../lh-model-provider" }
 lh-permission = { path = "../lh-permission" }
 lh-execution = { path = "../lh-execution" }
-lh-ledger = { path = "../lh-ledger" }
-lh-native-agent = { path = "../lh-native-agent" }
-lh-acp = { path = "../lh-acp" }
+lh-protocol = { path = "../lh-protocol" }
+agent-client-protocol-schema = "1"
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 tokio.workspace = true
-anyhow.workspace = true
-uuid.workspace = true
 async-trait.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
