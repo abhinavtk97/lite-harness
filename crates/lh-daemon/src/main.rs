@@ -218,13 +218,49 @@ async fn handle_connection(
     let params: SessionCreateParams = serde_json::from_value(req.params)?;
     let session_id = lh_event::SessionId::now_v7();
 
+    // Root substitution (architecture §12): `PrimarySelector::Delegated`
+    // means this session's *root* is driven by an external ACP agent, not
+    // the native loop -- orthogonal to `session/delegate`, which hands one
+    // task from an already-native root to a child. Resolved once here so
+    // every subsequent `session/prompt` on this connection knows which
+    // path to take without re-checking the registry.
+    let delegated_primary_adapter: Option<DelegatedAgentAdapter> = match &params.primary {
+        lh_protocol::PrimarySelector::Native => None,
+        lh_protocol::PrimarySelector::Delegated { agent } => {
+            let Some(adapter) = agents_registry.find(agent) else {
+                respond_err(
+                    &write_half,
+                    req.id,
+                    format!(
+                        "no delegated agent adapter configured for {agent:?} (see LITE_HARNESS_AGENTS_FILE)"
+                    ),
+                )
+                .await?;
+                return Ok(());
+            };
+            if !adapter.can_be_primary {
+                respond_err(
+                    &write_half,
+                    req.id,
+                    format!("adapter {agent:?} is not marked can_be_primary in the agent registry"),
+                )
+                .await?;
+                return Ok(());
+            }
+            Some(adapter.clone())
+        }
+    };
+
     store
         .append(Event::new(
             session_id,
             None,
             Actor::System,
             EventPayload::SessionDriverSet {
-                driver: SessionDriver::Native,
+                driver: match &delegated_primary_adapter {
+                    None => SessionDriver::Native,
+                    Some(adapter) => SessionDriver::Delegated { agent: adapter.kind.clone() },
+                },
             },
         ))
         .await?;
@@ -256,20 +292,38 @@ async fn handle_connection(
     loop {
         match read_message(&mut reader).await? {
             Some(Message::Request(req)) if req.method == methods::SESSION_PROMPT => {
-                handle_session_prompt(
-                    req,
-                    session_id,
-                    &workspace_root,
-                    &store,
-                    &resolved_provider,
-                    &permission_engine,
-                    &execution_plane,
-                    &pricing,
-                    &shared_prompter,
-                    &write_half,
-                    forwarded_seq.clone(),
-                )
-                .await?;
+                match &delegated_primary_adapter {
+                    None => {
+                        handle_session_prompt(
+                            req,
+                            session_id,
+                            &workspace_root,
+                            &store,
+                            &resolved_provider,
+                            &permission_engine,
+                            &execution_plane,
+                            &pricing,
+                            &shared_prompter,
+                            &write_half,
+                            forwarded_seq.clone(),
+                        )
+                        .await?;
+                    }
+                    Some(adapter) => {
+                        handle_session_prompt_delegated(
+                            req,
+                            session_id,
+                            &workspace_root,
+                            &store,
+                            adapter,
+                            &permission_engine,
+                            &execution_plane,
+                            &write_half,
+                            forwarded_seq.clone(),
+                        )
+                        .await?;
+                    }
+                }
             }
             Some(Message::Request(req)) if req.method == methods::LEDGER_QUERY => {
                 let params: LedgerQueryParams = serde_json::from_value(req.params)?;
@@ -384,6 +438,78 @@ async fn handle_session_prompt(
                 })
                 .expect("SessionPromptResult always serializes"),
             )),
+            Err(e) => Message::Response(Response::err(req_id, 1, e.to_string())),
+        };
+        let mut w = write_half.lock().await;
+        let _ = write_message(&mut *w, &msg).await;
+    });
+
+    Ok(())
+}
+
+/// `session/prompt` for a session whose root is `PrimarySelector::Delegated`
+/// (architecture §12, Phase 6) -- structurally identical in shape to
+/// `handle_session_prompt`, just driven by `lh_acp::delegate::run_primary_turn`
+/// (spawn/init/session-new/prompt against the external agent) instead of
+/// `NativeAgentLoop::run_turn`. Each call re-spawns and re-initializes the
+/// ACP subprocess rather than keeping one long-lived connection across
+/// multiple prompts on this session -- matching `session/delegate`'s
+/// existing per-call spawn behavior, not a new limitation introduced here.
+#[allow(clippy::too_many_arguments)]
+async fn handle_session_prompt_delegated(
+    req: ProtoRequest,
+    session_id: SessionId,
+    workspace_root: &std::path::Path,
+    store: &Arc<dyn SessionStore>,
+    adapter: &DelegatedAgentAdapter,
+    permission_engine: &Arc<dyn PermissionEngine>,
+    execution_plane: &Arc<dyn ExecutionPlane>,
+    write_half: &SharedWriter,
+    forwarded_seq: tokio::sync::watch::Receiver<Option<u64>>,
+) -> Result<()> {
+    let params: SessionPromptParams = serde_json::from_value(req.params)?;
+
+    let write_half = write_half.clone();
+    let store = store.clone();
+    let adapter = adapter.clone();
+    let permission_engine = permission_engine.clone();
+    let execution_plane = execution_plane.clone();
+    let workspace_root = workspace_root.to_path_buf();
+    let req_id = req.id;
+    let mut forwarded_seq = forwarded_seq;
+    tokio::spawn(async move {
+        let outcome = lh_acp::delegate::run_primary_turn(
+            session_id,
+            &workspace_root,
+            &adapter,
+            &params.text,
+            store.clone(),
+            permission_engine,
+            execution_plane,
+        )
+        .await;
+
+        if let Ok(target_seq) = store.latest_seq(session_id).await {
+            while forwarded_seq.borrow().unwrap_or(0) < target_seq {
+                if forwarded_seq.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+
+        let msg = match outcome {
+            Ok(outcome) => {
+                let stop_reason = match &outcome {
+                    lh_event::ChildOutcome::Success { .. } => "EndTurn".to_string(),
+                    lh_event::ChildOutcome::Failed { message } => format!("Failed: {message}"),
+                    lh_event::ChildOutcome::Cancelled => "Cancelled".to_string(),
+                };
+                Message::Response(Response::ok(
+                    req_id,
+                    serde_json::to_value(SessionPromptResult { stop_reason })
+                        .expect("SessionPromptResult always serializes"),
+                ))
+            }
             Err(e) => Message::Response(Response::err(req_id, 1, e.to_string())),
         };
         let mut w = write_half.lock().await;

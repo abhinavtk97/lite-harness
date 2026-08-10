@@ -1,7 +1,12 @@
 //! End-to-end delegation: spawn -> `initialize` -> `session/new` ->
-//! `session/prompt` -> `ChildSessionSpawned`/`ChildSessionEnded`
-//! (architecture §5's flow, applied to a child session rather than the
-//! root -- root substitution via `PrimarySelector` is Phase 6/§12).
+//! `session/prompt` (architecture §5's flow). Two entry points share the
+//! same inner turn logic (`run_delegation_inner`):
+//! `run_delegation` wraps it with `ChildSessionSpawned`/`ChildSessionEnded`
+//! bookkeeping for a *child* session; `run_primary_turn` (architecture
+//! §12, Phase 6) calls it directly for a session that is itself the root
+//! -- there's no parent to wrap, since nothing about ACP's spawn/connect
+//! flow cares whether the resulting session is attached as a child or
+//! *is* the tree's root (§12's key insight).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -95,6 +100,62 @@ pub async fn run_delegation(
             EventPayload::ChildSessionEnded { child: child_session_id, outcome: outcome.clone() },
         ))
         .await?;
+
+    Ok(outcome)
+}
+
+/// Runs one prompt turn for a session whose *own* driver is
+/// `SessionDriver::Delegated` (root substitution, architecture §12) --
+/// unlike `run_delegation`, `session_id` here has no parent and there is
+/// no `ChildSessionSpawned`/`ChildSessionEnded` wrapping to do; the
+/// session itself already got its `SessionDriverSet { driver: Delegated }`
+/// at `session/create` time (`lh-daemon`). A failure is recorded as an
+/// `Error` event directly on this session -- the same role
+/// `ChildSessionEnded { outcome: Failed }` plays for a child, since there's
+/// no parent event to carry that information here.
+pub async fn run_primary_turn(
+    session_id: SessionId,
+    workspace_root: &Path,
+    adapter: &DelegatedAgentAdapter,
+    task_summary: &str,
+    store: Arc<dyn SessionStore>,
+    permission_engine: Arc<dyn PermissionEngine>,
+    execution_plane: Arc<dyn ExecutionPlane>,
+) -> Result<ChildOutcome> {
+    store
+        .append(Event::new(
+            session_id,
+            None,
+            Actor::User,
+            EventPayload::UserMessage { content: vec![ContentBlock::text(task_summary)] },
+        ))
+        .await?;
+
+    let outcome = run_delegation_inner(
+        session_id,
+        workspace_root,
+        adapter,
+        task_summary,
+        store.clone(),
+        permission_engine,
+        execution_plane,
+    )
+    .await;
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            store
+                .append(Event::new(
+                    session_id,
+                    None,
+                    Actor::System,
+                    EventPayload::Error { message: e.to_string(), recoverable: true },
+                ))
+                .await?;
+            ChildOutcome::Failed { message: e.to_string() }
+        }
+    };
 
     Ok(outcome)
 }

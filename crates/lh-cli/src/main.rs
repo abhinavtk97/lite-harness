@@ -15,40 +15,66 @@ use lh_event::{AgentKind, ContentBlock, Event, EventPayload, PermissionDecision}
 use lh_protocol::{
     buffered, default_socket_path, methods, read_message, write_message, InitializeParams,
     InitializeResult, LedgerQueryParams, LedgerQueryResult, Message, PermissionAskParams,
-    PermissionAskResult, Request, RequestId, Response, SessionCreateParams, SessionCreateResult,
-    SessionDelegateParams, SessionDelegateResult, SessionPromptParams, SessionPromptResult,
-    PROTOCOL_VERSION,
+    PermissionAskResult, PrimarySelector, Request, RequestId, Response, SessionCreateParams,
+    SessionCreateResult, SessionDelegateParams, SessionDelegateResult, SessionPromptParams,
+    SessionPromptResult, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tokio::net::UnixStream;
 
-/// `lite-harness [--agent claude-code] <prompt>` -- omitting `--agent`
-/// keeps today's default (native loop, `session/prompt`); naming an agent
-/// sends `session/delegate` instead (architecture §11 phase 4). Just this
-/// one flag for v1, matching the single delegated-agent-set decision.
-fn parse_args() -> Result<(Option<AgentKind>, String)> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: lite-harness [--agent claude-code] <prompt>\n  \
-        e.g. lite-harness \"list the files in this directory\"\n  \
-        e.g. lite-harness --agent claude-code \"fix the failing test\"";
+/// `--agent <agent>` (architecture §11 phase 4) hands one task from a
+/// `Native` root to a child via `session/delegate` -- the root session
+/// stays native. `--primary <agent>` (architecture §12, Phase 6) is the
+/// orthogonal capability: the *whole* session's root is driven by that
+/// agent from `session/create` on, via a normal `session/prompt`. The two
+/// are mutually exclusive on one CLI invocation.
+#[derive(Debug, Clone)]
+enum CliMode {
+    Native,
+    DelegateChild(AgentKind),
+    PrimaryDelegated(AgentKind),
+}
 
-    if args.first().map(String::as_str) == Some("--agent") {
-        let name = args.get(1).ok_or_else(|| anyhow!("{usage}\n\n--agent requires a value"))?;
-        let agent = match name.as_str() {
-            "claude-code" => AgentKind::ClaudeCode,
-            other => anyhow::bail!("{usage}\n\nunknown agent '{other}' (only 'claude-code' is supported today)"),
-        };
-        let prompt = args.get(2).ok_or_else(|| anyhow!("{usage}"))?.clone();
-        Ok((Some(agent), prompt))
-    } else {
-        let prompt = args.first().ok_or_else(|| anyhow!("{usage}"))?.clone();
-        Ok((None, prompt))
+fn parse_agent_name(usage: &str, name: &str) -> Result<AgentKind> {
+    match name {
+        "claude-code" => Ok(AgentKind::ClaudeCode),
+        other => anyhow::bail!("{usage}\n\nunknown agent '{other}' (only 'claude-code' is supported today)"),
+    }
+}
+
+/// `lite-harness [--agent claude-code | --primary claude-code] <prompt>` --
+/// omitting both flags keeps today's default (native loop driving the
+/// root, plain `session/prompt`).
+fn parse_args() -> Result<(CliMode, String)> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let usage = "usage: lite-harness [--agent claude-code | --primary claude-code] <prompt>\n  \
+        e.g. lite-harness \"list the files in this directory\"\n  \
+        e.g. lite-harness --agent claude-code \"fix the failing test\"\n  \
+        e.g. lite-harness --primary claude-code \"refactor this module\"";
+
+    match args.first().map(String::as_str) {
+        Some("--agent") => {
+            let name = args.get(1).ok_or_else(|| anyhow!("{usage}\n\n--agent requires a value"))?;
+            let agent = parse_agent_name(usage, name)?;
+            let prompt = args.get(2).ok_or_else(|| anyhow!("{usage}"))?.clone();
+            Ok((CliMode::DelegateChild(agent), prompt))
+        }
+        Some("--primary") => {
+            let name = args.get(1).ok_or_else(|| anyhow!("{usage}\n\n--primary requires a value"))?;
+            let agent = parse_agent_name(usage, name)?;
+            let prompt = args.get(2).ok_or_else(|| anyhow!("{usage}"))?.clone();
+            Ok((CliMode::PrimaryDelegated(agent), prompt))
+        }
+        _ => {
+            let prompt = args.first().ok_or_else(|| anyhow!("{usage}"))?.clone();
+            Ok((CliMode::Native, prompt))
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (agent, prompt) = parse_args()?;
+    let (mode, prompt) = parse_args()?;
 
     let cwd = std::env::current_dir()?;
     let sock_path = default_socket_path(&cwd);
@@ -70,6 +96,10 @@ async fn main() -> Result<()> {
     .await?;
     eprintln!("connected to daemon (protocol v{})", init_result.protocol_version);
 
+    let primary = match &mode {
+        CliMode::PrimaryDelegated(agent) => PrimarySelector::Delegated { agent: agent.clone() },
+        CliMode::Native | CliMode::DelegateChild(_) => PrimarySelector::Native,
+    };
     let create_result: SessionCreateResult = request(
         &mut write_half,
         &mut reader,
@@ -77,6 +107,7 @@ async fn main() -> Result<()> {
         methods::SESSION_CREATE,
         serde_json::to_value(SessionCreateParams {
             cwd: cwd.to_string_lossy().to_string(),
+            primary,
         })?,
     )
     .await?;
@@ -84,8 +115,15 @@ async fn main() -> Result<()> {
 
     let prompt_id = next_id;
     next_id += 1;
-    match &agent {
-        None => {
+    // `session/delegate` is the only mode that isn't a plain `session/prompt`
+    // -- `PrimaryDelegated` already told the daemon which driver to use at
+    // `session/create`, so it still speaks `session/prompt` like `Native` does.
+    let is_delegate_child = matches!(mode, CliMode::DelegateChild(_));
+    match &mode {
+        CliMode::Native | CliMode::PrimaryDelegated(_) => {
+            if let CliMode::PrimaryDelegated(agent) = &mode {
+                eprintln!("root session driven by {agent:?}\n");
+            }
             write_message(
                 &mut write_half,
                 &Message::Request(Request::new(
@@ -96,7 +134,7 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Some(agent) => {
+        CliMode::DelegateChild(agent) => {
             eprintln!("delegating to {agent:?}\n");
             write_message(
                 &mut write_half,
@@ -139,7 +177,7 @@ async fn main() -> Result<()> {
             Some(Message::Response(resp)) if resp.id == prompt_id => {
                 if let Some(err) = resp.error {
                     eprintln!("\n[turn failed] {}", err.message);
-                } else if agent.is_some() {
+                } else if is_delegate_child {
                     let result: SessionDelegateResult =
                         serde_json::from_value(resp.result.unwrap_or_default())?;
                     println!(

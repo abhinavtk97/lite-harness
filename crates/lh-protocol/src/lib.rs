@@ -151,6 +151,22 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateParams {
     pub cwd: String,
+    /// Which driver owns the *root* session (architecture §12) -- defaults
+    /// to `Native` so every pre-Phase-6 caller that never set this field
+    /// keeps today's behavior unchanged. `session/delegate` (unaffected by
+    /// this field) remains the way a `Native` root hands off one task to a
+    /// child; this is the orthogonal "the whole session is driven by an
+    /// external agent from the start" capability.
+    #[serde(default)]
+    pub primary: PrimarySelector,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PrimarySelector {
+    #[default]
+    Native,
+    Delegated { agent: lh_event::AgentKind },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
