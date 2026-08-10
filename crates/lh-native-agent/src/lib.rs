@@ -13,10 +13,14 @@
 //! recursively: `spawn_subagent` is a built-in tool gated through the
 //! identical `PermissionEngine` path as every other tool, and
 //! `run_subagent` just constructs another `NativeAgentLoop` for the child
-//! session -- "same machinery," not a parallel mechanism. No `ChildRunner`
-//! trait yet (that's Phase 6's extraction into `lh-orchestration`, once
-//! ACP delegation and native subagents both exist to generalize over --
-//! premature here).
+//! session -- "same machinery," not a parallel mechanism.
+//!
+//! `NativeAgentLoop` implements `lh_orchestration::ChildRunner` directly
+//! (Phase 6, §12.3): the trait's `run()` *is* `run_subagent`'s core logic,
+//! just returning the freshly minted child `SessionId` alongside the
+//! `ChildOutcome` instead of the pre-formatted tool-feedback string --
+//! `run_subagent` itself is now a thin wrapper around it, kept because
+//! `handle_one_tool_call` needs that formatted string, not a raw outcome.
 
 mod tools;
 
@@ -24,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use async_trait::async_trait;
 use lh_event::{
     Actor, ChildKind, ChildOutcome, ChildSpec, ContentBlock, Event, EventPayload,
     PermissionDecision, PermissionRequest, SessionDriver, SessionId, ToolCall, ToolCallStatus,
@@ -31,6 +36,7 @@ use lh_event::{
 };
 use lh_execution::ExecutionPlane;
 use lh_model_provider::{ChatContent, ChatMessage, ChatRole, ModelProvider, ModelRequest, ToolSpec};
+use lh_orchestration::{ChildRunner, TaskHandoff};
 use lh_permission::{DefaultPermissionEngine, PermissionEngine, PermissionPrompter};
 use lh_store::SessionStore;
 
@@ -124,29 +130,21 @@ fn available_tool_specs(config: &AgentConfig) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// A self-contained task handed to a native subagent (architecture §9) --
-/// deliberately *not* the parent's transcript, only these explicit
-/// instructions, so context isolation is structural rather than a
-/// discipline the parent has to maintain.
-#[derive(Debug, Clone)]
-pub struct TaskHandoff {
-    pub role: String,
-    pub instructions: String,
-    pub tool_allowlist: Option<Vec<String>>,
-    pub max_turns: Option<usize>,
-}
-
-impl TaskHandoff {
-    fn from_tool_input(input: &serde_json::Value) -> Option<Self> {
-        Some(Self {
-            role: input.get("role")?.as_str()?.to_string(),
-            instructions: input.get("instructions")?.as_str()?.to_string(),
-            tool_allowlist: input.get("tool_allowlist").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
-            }),
-            max_turns: input.get("max_turns").and_then(|v| v.as_u64()).map(|n| n as usize),
-        })
-    }
+/// Parses a `spawn_subagent` tool call's raw JSON input into a
+/// `lh_orchestration::TaskHandoff`. An inherent impl can't live on
+/// `TaskHandoff` itself now that the type is defined in `lh-orchestration`
+/// (Rust's orphan rules only allow inherent methods in the defining
+/// crate), so this is a free function instead.
+fn task_handoff_from_tool_input(input: &serde_json::Value) -> Option<TaskHandoff> {
+    Some(TaskHandoff {
+        role: input.get("role")?.as_str()?.to_string(),
+        instructions: input.get("instructions")?.as_str()?.to_string(),
+        tool_allowlist: input
+            .get("tool_allowlist")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()),
+        max_turns: input.get("max_turns").and_then(|v| v.as_u64()).map(|n| n as usize),
+    })
 }
 
 pub struct NativeAgentLoop {
@@ -360,7 +358,7 @@ impl NativeAgentLoop {
         let (status, output, is_error) = match &decision {
             PermissionDecision::Allow | PermissionDecision::AllowAlways { .. } => {
                 if tool_name == "spawn_subagent" {
-                    match TaskHandoff::from_tool_input(input) {
+                    match task_handoff_from_tool_input(input) {
                         Some(task) => match self.run_subagent(session_id, task).await {
                             Ok(summary) => (ToolCallStatus::Completed, summary, false),
                             Err(e) => (ToolCallStatus::Failed, e.to_string(), true),
@@ -397,23 +395,49 @@ impl NativeAgentLoop {
         Ok((output, is_error))
     }
 
+    /// Thin wrapper around `run_subagent_outcome` (the `ChildRunner::run`
+    /// logic) for `handle_one_tool_call`'s spawn_subagent branch, which
+    /// needs a single formatted string to feed back to the model as the
+    /// tool result -- not a raw `SessionId`/`ChildOutcome` pair.
+    async fn run_subagent(&self, parent_session_id: SessionId, task: TaskHandoff) -> Result<String> {
+        let (_, outcome) = self.run_subagent_outcome(parent_session_id, task).await?;
+        Ok(match outcome {
+            ChildOutcome::Success { summary } => summary,
+            ChildOutcome::Failed { message } => format!("subagent failed: {message}"),
+            ChildOutcome::Cancelled => "subagent was cancelled".to_string(),
+        })
+    }
+
     /// Runs one native subagent to completion as a child of `parent_session_id`
     /// (architecture §9) -- the exact same session-tree, permission, and
     /// cost machinery a delegated ACP agent uses (`lh-acp::delegate::
     /// run_delegation`), just driven by another `NativeAgentLoop` in-process
-    /// instead of a subprocess round-trip. Returns the subagent's final
-    /// answer text (derived from its own event log, not carried out of
-    /// `run_turn` some other way -- consistent with "the event log is the
-    /// sole state-changing primitive").
-    async fn run_subagent(&self, parent_session_id: SessionId, task: TaskHandoff) -> Result<String> {
+    /// instead of a subprocess round-trip. This is `ChildRunner::run`'s
+    /// actual body (see the `impl ChildRunner for NativeAgentLoop` below);
+    /// it's a plain method rather than living directly in the trait impl
+    /// only so `run_subagent` above can call it without going through a
+    /// trait object.
+    async fn run_subagent_outcome(
+        &self,
+        parent_session_id: SessionId,
+        task: TaskHandoff,
+    ) -> Result<(SessionId, ChildOutcome)> {
         if self.config.subagent_depth >= MAX_SUBAGENT_DEPTH {
             // Defense in depth: `available_tool_specs` already keeps this
             // unreachable by not advertising `spawn_subagent` at max depth,
             // but a caller that bypasses tool-spec filtering must still be
-            // refused here, structurally, not just by convention.
-            return Ok(format!(
-                "refused: subagent nesting depth {} would exceed the cap ({MAX_SUBAGENT_DEPTH})",
-                self.config.subagent_depth + 1
+            // refused here, structurally, not just by convention. No child
+            // session is ever created on this path, so the returned id is
+            // a throwaway -- callers must key off `ChildOutcome::Failed`,
+            // not this id, to detect a refusal.
+            return Ok((
+                SessionId::now_v7(),
+                ChildOutcome::Failed {
+                    message: format!(
+                        "refused: subagent nesting depth {} would exceed the cap ({MAX_SUBAGENT_DEPTH})",
+                        self.config.subagent_depth + 1
+                    ),
+                },
             ));
         }
 
@@ -503,11 +527,7 @@ impl NativeAgentLoop {
         )
         .await?;
 
-        match outcome {
-            ChildOutcome::Success { summary } => Ok(summary),
-            ChildOutcome::Failed { message } => Ok(format!("subagent failed: {message}")),
-            ChildOutcome::Cancelled => Ok("subagent was cancelled".to_string()),
-        }
+        Ok((child_session_id, outcome))
     }
 
     async fn summarize_child_messages(&self, child_session_id: SessionId) -> Result<String> {
@@ -521,6 +541,21 @@ impl NativeAgentLoop {
             }
         }
         Ok(if text.is_empty() { "(subagent produced no text response)".to_string() } else { text })
+    }
+}
+
+/// Architecture §12.3: the driver-neutral entry point a future
+/// `lh-orchestration-mcp` (or any other generic caller holding an
+/// `Arc<dyn ChildRunner>`) would use to spawn a native subagent, without
+/// needing to know it's talking to a `NativeAgentLoop` specifically.
+#[async_trait]
+impl ChildRunner for NativeAgentLoop {
+    async fn run(
+        &self,
+        parent_session_id: SessionId,
+        task: TaskHandoff,
+    ) -> lh_orchestration::Result<(SessionId, ChildOutcome)> {
+        self.run_subagent_outcome(parent_session_id, task).await.map_err(Into::into)
     }
 }
 
@@ -892,6 +927,56 @@ mod tests {
         // Refused before ever touching the store's session tree for a child.
         let events = store.read_from(session_id, 0).await.unwrap();
         assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_runner_trait_impl_returns_the_childs_session_id_and_outcome() {
+        // Proves the ChildRunner impl is genuinely wired, not just defined:
+        // a generic caller holding only `&dyn ChildRunner` (e.g. a future
+        // lh-orchestration-mcp) gets the exact same session-tree behavior
+        // the spawn_subagent tool's own direct call to `run_subagent` does.
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let provider = Arc::new(ScriptedModelProvider::new(vec![text_response("done")]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let parent_session_id = SessionId::now_v7();
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let runner: &dyn ChildRunner = &agent;
+        let (child_session_id, outcome) = runner
+            .run(
+                parent_session_id,
+                TaskHandoff {
+                    role: "worker".to_string(),
+                    instructions: "do the thing".to_string(),
+                    tool_allowlist: None,
+                    max_turns: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, ChildOutcome::Success { summary } if summary == "done"));
+
+        let child_events = store.read_from(child_session_id, 0).await.unwrap();
+        assert!(!child_events.is_empty(), "the child session the trait returned must be real, not a throwaway id");
+        let parent_events = store.read_from(parent_session_id, 0).await.unwrap();
+        let kinds: Vec<&str> = parent_events.iter().map(payload_kind).collect();
+        assert_eq!(kinds, vec!["ChildSessionSpawned", "ChildSessionEnded"]);
     }
 
     #[tokio::test]

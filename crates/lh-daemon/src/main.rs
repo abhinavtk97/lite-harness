@@ -16,11 +16,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{ensure, Result};
-use lh_acp::{registry::AgentsFile, DelegatedAgentAdapter};
+use lh_acp::{registry::AgentsFile, AcpDelegatedRunner, DelegatedAgentAdapter};
 use lh_event::{Actor, Event, EventPayload, SessionDriver, SessionId};
 use lh_execution::{ExecutionPlane, LocalExecutionPlane};
 use lh_ledger::{CostLedger, PricingTable, StoreBackedCostLedger};
 use lh_native_agent::{AgentConfig, NativeAgentLoop};
+use lh_orchestration::{ChildRunner, TaskHandoff};
 use lh_permission::{DefaultPermissionEngine, PermissionEngine, SessionPolicyStore, TomlPolicyStore};
 use lh_protocol::{
     buffered, default_socket_path, methods, read_message, write_message, InitializeResult,
@@ -552,7 +553,6 @@ async fn handle_session_delegate(
         return Ok(());
     };
     let adapter: DelegatedAgentAdapter = adapter.clone();
-    let child_session_id = SessionId::now_v7();
 
     let write_half = write_half.clone();
     let store = store.clone();
@@ -562,15 +562,27 @@ async fn handle_session_delegate(
     let req_id = req.id;
     let mut forwarded_seq = forwarded_seq;
     tokio::spawn(async move {
-        let outcome = lh_acp::delegate::run_delegation(
-            parent_session_id,
-            child_session_id,
-            &workspace_root,
-            &adapter,
-            &params.task_summary,
-            store.clone(),
+        // Goes through the driver-neutral ChildRunner trait (architecture
+        // §12.3) rather than calling lh_acp::delegate::run_delegation
+        // directly -- proves the same abstraction NativeAgentLoop's own
+        // ChildRunner impl uses for spawn_subagent really does unify both
+        // dispatch paths, not just define a trait nothing calls.
+        let runner = AcpDelegatedRunner {
+            adapter,
+            workspace_root,
+            store: store.clone(),
             permission_engine,
             execution_plane,
+        };
+        let result = ChildRunner::run(
+            &runner,
+            parent_session_id,
+            TaskHandoff {
+                role: String::new(),
+                instructions: params.task_summary,
+                tool_allowlist: None,
+                max_turns: None,
+            },
         )
         .await;
 
@@ -582,8 +594,8 @@ async fn handle_session_delegate(
             }
         }
 
-        let msg = match outcome {
-            Ok(outcome) => Message::Response(Response::ok(
+        let msg = match result {
+            Ok((child_session_id, outcome)) => Message::Response(Response::ok(
                 req_id,
                 serde_json::to_value(SessionDelegateResult { child_session_id, outcome })
                     .expect("SessionDelegateResult always serializes"),

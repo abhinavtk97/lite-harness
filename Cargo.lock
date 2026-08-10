@@ -949,6 +949,7 @@ dependencies = [
  "async-trait",
  "lh-event",
  "lh-execution",
+ "lh-orchestration",
  "lh-permission",
  "lh-protocol",
  "lh-store",
@@ -985,6 +986,7 @@ dependencies = [
  "lh-ledger",
  "lh-model-provider",
  "lh-native-agent",
+ "lh-orchestration",
  "lh-permission",
  "lh-protocol",
  "lh-store",
@@ -1055,6 +1057,7 @@ dependencies = [
  "lh-execution",
  "lh-ledger",
  "lh-model-provider",
+ "lh-orchestration",
  "lh-permission",
  "lh-store",
  "serde",
@@ -1062,6 +1065,15 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "lh-orchestration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "lh-event",
 ]
 
 [[package]]

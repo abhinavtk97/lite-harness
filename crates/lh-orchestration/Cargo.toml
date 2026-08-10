@@ -1,0 +1,9 @@
+[package]
+name = "lh-orchestration"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lh-event = { path = "../lh-event" }
+async-trait.workspace = true
+anyhow.workspace = true

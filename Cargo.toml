@@ -9,6 +9,7 @@ members = [
     "crates/lh-acp",
     "crates/lh-execution",
     "crates/lh-ledger",
+    "crates/lh-orchestration",
     "crates/lh-native-agent",
     "crates/lh-daemon",
     "crates/lh-cli",

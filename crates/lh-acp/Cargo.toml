@@ -9,6 +9,7 @@ lh-store = { path = "../lh-store" }
 lh-permission = { path = "../lh-permission" }
 lh-execution = { path = "../lh-execution" }
 lh-protocol = { path = "../lh-protocol" }
+lh-orchestration = { path = "../lh-orchestration" }
 agent-client-protocol-schema = "1"
 serde.workspace = true
 serde_json.workspace = true

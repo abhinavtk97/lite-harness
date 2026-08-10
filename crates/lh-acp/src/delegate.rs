@@ -6,18 +6,23 @@
 //! §12, Phase 6) calls it directly for a session that is itself the root
 //! -- there's no parent to wrap, since nothing about ACP's spawn/connect
 //! flow cares whether the resulting session is attached as a child or
-//! *is* the tree's root (§12's key insight).
+//! *is* the tree's root (§12's key insight). `AcpDelegatedRunner` (§12.3)
+//! is a third, thinner entry point: a `ChildRunner` impl over
+//! `run_delegation`, for callers that want the driver-neutral trait
+//! rather than this module's own free functions.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use agent_client_protocol_schema::v1 as acp;
+use async_trait::async_trait;
 use lh_event::{
     Actor, ChildKind, ChildOutcome, ChildSpec, ContentBlock, Event, EventPayload, SessionDriver,
     SessionId, UsageConfidence, UsageDelta,
 };
 use lh_execution::ExecutionPlane;
+use lh_orchestration::{ChildRunner, TaskHandoff};
 use lh_permission::PermissionEngine;
 use lh_store::SessionStore;
 
@@ -237,4 +242,43 @@ async fn run_delegation_inner(
         acp::StopReason::Cancelled => ChildOutcome::Cancelled,
         _ => ChildOutcome::Failed { message: summary },
     })
+}
+
+/// `ChildRunner` impl for ACP delegation (architecture §12.3) -- a thin
+/// adapter over `run_delegation`, which still does the actual work; this
+/// exists so a generic caller (the daemon's `session/delegate` handler
+/// today, `lh-orchestration-mcp` eventually) can hold one
+/// `Arc<dyn ChildRunner>` per delegated-agent adapter instead of calling
+/// `run_delegation` directly. `TaskHandoff`'s `role`/`tool_allowlist`/
+/// `max_turns` are native-subagent-specific knobs an ACP agent doesn't
+/// take from us -- only `instructions` (as `task_summary`) is used.
+pub struct AcpDelegatedRunner {
+    pub adapter: DelegatedAgentAdapter,
+    pub workspace_root: PathBuf,
+    pub store: Arc<dyn SessionStore>,
+    pub permission_engine: Arc<dyn PermissionEngine>,
+    pub execution_plane: Arc<dyn ExecutionPlane>,
+}
+
+#[async_trait]
+impl ChildRunner for AcpDelegatedRunner {
+    async fn run(
+        &self,
+        parent_session_id: SessionId,
+        task: TaskHandoff,
+    ) -> lh_orchestration::Result<(SessionId, ChildOutcome)> {
+        let child_session_id = SessionId::now_v7();
+        let outcome = run_delegation(
+            parent_session_id,
+            child_session_id,
+            &self.workspace_root,
+            &self.adapter,
+            &task.instructions,
+            self.store.clone(),
+            self.permission_engine.clone(),
+            self.execution_plane.clone(),
+        )
+        .await?;
+        Ok((child_session_id, outcome))
+    }
 }

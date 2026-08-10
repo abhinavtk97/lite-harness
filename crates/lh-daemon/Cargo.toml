@@ -17,6 +17,7 @@ lh-execution = { path = "../lh-execution" }
 lh-ledger = { path = "../lh-ledger" }
 lh-native-agent = { path = "../lh-native-agent" }
 lh-acp = { path = "../lh-acp" }
+lh-orchestration = { path = "../lh-orchestration" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

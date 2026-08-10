@@ -11,5 +11,6 @@ pub mod registry;
 pub mod transport;
 
 pub use client::HarnessAcpClient;
+pub use delegate::AcpDelegatedRunner;
 pub use registry::{AgentsFile, DelegatedAgentAdapter, SpawnSpec};
 pub use transport::{AcpConnection, AcpTransportError};
