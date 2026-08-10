@@ -2,7 +2,14 @@ name: release
 
 # Builds lite-harness / lite-harnessd release binaries and attaches them to
 # a GitHub Release. Windows is out of scope for v1 (see docs/architecture)
-# so only Linux and macOS are built.
+# so only Linux and macOS are built. macOS is Apple Silicon (aarch64) only
+# -- the free-tier Intel (x86_64) hosted runner (macos-13) was observed
+# stuck "queued" with no runner ever assigned (confirmed live, not assumed:
+# a tag-on-merge run sat queued on it for 9+ minutes while the other two
+# matrix legs completed normally), consistent with GitHub having wound
+# down free Intel macOS runner capacity as part of its Apple Silicon
+# transition. Re-add an x86_64 macOS leg only if that capacity comes back
+# or a paid runner tier is available.
 #
 # Two ways in:
 #   - `push: tags: v*.*.*` -- a human (or any token that isn't the default
@@ -40,9 +47,6 @@ jobs:
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
-          - name: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
     steps:
