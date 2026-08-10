@@ -300,6 +300,9 @@ fn describe_action(action: &lh_event::PermissionAction) -> String {
         lh_event::PermissionAction::DelegateAgent { target, task_summary } => {
             format!("delegate to {target:?}: {task_summary}")
         }
+        lh_event::PermissionAction::SpawnSubagent { role, task_summary } => {
+            format!("spawn subagent ({role}): {task_summary}")
+        }
     }
 }
 

@@ -46,6 +46,28 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
                 "required": ["command"]
             }),
         },
+        ToolSpec {
+            name: "spawn_subagent".to_string(),
+            description: "Delegate a focused sub-task to a fresh native subagent with its own \
+                conversation (it does not see this conversation's history, only the instructions \
+                given here). Returns the subagent's final answer as text. Optionally restrict \
+                which tools it may use."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role": { "type": "string", "description": "short label for what this subagent is for" },
+                    "instructions": { "type": "string", "description": "the task, self-contained" },
+                    "tool_allowlist": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "optional subset of tool names the subagent may use"
+                    },
+                    "max_turns": { "type": "integer", "description": "optional cap on model<->tool round-trips" }
+                },
+                "required": ["role", "instructions"]
+            }),
+        },
     ]
 }
 
@@ -63,6 +85,10 @@ pub fn permission_action_for(tool_name: &str, input: &serde_json::Value) -> Perm
             args: vec![],
             cwd: PathBuf::from("."),
         },
+        "spawn_subagent" => PermissionAction::SpawnSubagent {
+            role: str_arg(input, "role").unwrap_or_default().to_string(),
+            task_summary: str_arg(input, "instructions").unwrap_or_default().to_string(),
+        },
         other => PermissionAction::Exec {
             command: other.to_string(),
             args: vec![],
@@ -76,6 +102,7 @@ pub fn risk_tier_for(tool_name: &str) -> RiskTier {
         "read_file" => RiskTier::Read,
         "write_file" => RiskTier::Write,
         "bash" => RiskTier::Execute,
+        "spawn_subagent" => RiskTier::Execute,
         _ => RiskTier::Execute,
     }
 }
@@ -102,5 +129,19 @@ mod tests {
         assert_eq!(risk_tier_for("read_file"), RiskTier::Read);
         assert_eq!(risk_tier_for("write_file"), RiskTier::Write);
         assert_eq!(risk_tier_for("bash"), RiskTier::Execute);
+        assert_eq!(risk_tier_for("spawn_subagent"), RiskTier::Execute);
+    }
+
+    #[test]
+    fn spawn_subagent_gets_its_own_permission_action() {
+        let action = permission_action_for(
+            "spawn_subagent",
+            &serde_json::json!({"role": "researcher", "instructions": "find the bug"}),
+        );
+        assert!(matches!(
+            action,
+            PermissionAction::SpawnSubagent { role, task_summary }
+                if role == "researcher" && task_summary == "find the bug"
+        ));
     }
 }

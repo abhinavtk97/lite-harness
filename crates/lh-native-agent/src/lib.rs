@@ -8,8 +8,15 @@
 //!
 //! Sandboxing (Landlock/Seatbelt) lives behind the `ExecutionPlane` this
 //! loop is handed at construction (`lh-execution`, architecture §8).
-//! Phase 3 scope beyond that: still no policy persistence (every tool call
-//! is asked about, via `PermissionEngine`), no subagents, no ACP.
+//!
+//! Native subagents (architecture §9) reuse this exact same loop
+//! recursively: `spawn_subagent` is a built-in tool gated through the
+//! identical `PermissionEngine` path as every other tool, and
+//! `run_subagent` just constructs another `NativeAgentLoop` for the child
+//! session -- "same machinery," not a parallel mechanism. No `ChildRunner`
+//! trait yet (that's Phase 6's extraction into `lh-orchestration`, once
+//! ACP delegation and native subagents both exist to generalize over --
+//! premature here).
 
 mod tools;
 
@@ -18,15 +25,23 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lh_event::{
-    Actor, ContentBlock, Event, EventPayload, PermissionDecision, PermissionRequest, SessionId,
-    ToolCall, ToolCallStatus, ToolSource, UsageConfidence, UsageDelta,
+    Actor, ChildKind, ChildOutcome, ChildSpec, ContentBlock, Event, EventPayload,
+    PermissionDecision, PermissionRequest, SessionDriver, SessionId, ToolCall, ToolCallStatus,
+    ToolSource, UsageConfidence, UsageDelta,
 };
 use lh_execution::ExecutionPlane;
-use lh_model_provider::{ChatContent, ChatMessage, ChatRole, ModelProvider, ModelRequest};
-use lh_permission::PermissionEngine;
+use lh_model_provider::{ChatContent, ChatMessage, ChatRole, ModelProvider, ModelRequest, ToolSpec};
+use lh_permission::{DefaultPermissionEngine, PermissionEngine, PermissionPrompter};
 use lh_store::SessionStore;
 
 pub use tools::builtin_tool_specs;
+
+/// Structural cap on subagent nesting depth (a subagent spawning its own
+/// subagent, etc.) -- mirrors the `max_delegation_depth` default already
+/// established for ACP delegation (architecture §12.4), same failure
+/// class (runaway recursive spawning). Enforced by not even advertising
+/// `spawn_subagent` to the model once reached, not just by convention.
+pub const MAX_SUBAGENT_DEPTH: usize = 3;
 
 pub type Result<T> = std::result::Result<T, AgentError>;
 
@@ -61,6 +76,17 @@ pub struct AgentConfig {
     /// that already matters).
     pub max_iterations: usize,
     pub workspace_root: PathBuf,
+    /// Restricts which built-in tools this loop advertises to the model --
+    /// `None` means all of them. A subagent's allowlist (architecture §9)
+    /// must be a subset of its parent's; since v1 has no per-session
+    /// notion of "the parent's own allowlist" beyond this same field, the
+    /// natural subset check is just: the child's allowlist can only ever
+    /// name tools that exist at all, which `available_tool_specs` already
+    /// enforces by filtering rather than trusting the list verbatim.
+    pub tool_allowlist: Option<Vec<String>>,
+    /// 0 for a root session; incremented by one for each level of
+    /// `spawn_subagent` nesting (see `MAX_SUBAGENT_DEPTH`).
+    pub subagent_depth: usize,
 }
 
 impl Default for AgentConfig {
@@ -74,7 +100,52 @@ impl Default for AgentConfig {
             max_tokens: 4096,
             max_iterations: 12,
             workspace_root: PathBuf::from("."),
+            tool_allowlist: None,
+            subagent_depth: 0,
         }
+    }
+}
+
+/// The tools this loop actually advertises to the model: `builtin_tool_specs()`
+/// filtered by `config.tool_allowlist` (if set), with `spawn_subagent`
+/// additionally stripped once `MAX_SUBAGENT_DEPTH` is reached -- the
+/// structural half of the depth cap (the runtime check in `run_subagent`
+/// is the other half, in case a caller ever bypasses this listing).
+fn available_tool_specs(config: &AgentConfig) -> Vec<ToolSpec> {
+    builtin_tool_specs()
+        .into_iter()
+        .filter(|spec| {
+            config
+                .tool_allowlist
+                .as_ref()
+                .is_none_or(|allowed| allowed.iter().any(|name| name == &spec.name))
+        })
+        .filter(|spec| spec.name != "spawn_subagent" || config.subagent_depth < MAX_SUBAGENT_DEPTH)
+        .collect()
+}
+
+/// A self-contained task handed to a native subagent (architecture §9) --
+/// deliberately *not* the parent's transcript, only these explicit
+/// instructions, so context isolation is structural rather than a
+/// discipline the parent has to maintain.
+#[derive(Debug, Clone)]
+pub struct TaskHandoff {
+    pub role: String,
+    pub instructions: String,
+    pub tool_allowlist: Option<Vec<String>>,
+    pub max_turns: Option<usize>,
+}
+
+impl TaskHandoff {
+    fn from_tool_input(input: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            role: input.get("role")?.as_str()?.to_string(),
+            instructions: input.get("instructions")?.as_str()?.to_string(),
+            tool_allowlist: input.get("tool_allowlist").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+            }),
+            max_turns: input.get("max_turns").and_then(|v| v.as_u64()).map(|n| n as usize),
+        })
     }
 }
 
@@ -84,6 +155,14 @@ pub struct NativeAgentLoop {
     permission_engine: Arc<dyn PermissionEngine>,
     execution_plane: Arc<dyn ExecutionPlane>,
     pricing: Arc<lh_ledger::PricingTable>,
+    /// Held separately from `permission_engine` (a trait object that
+    /// doesn't expose its internals) so `run_subagent` can build a fresh,
+    /// *session-scoped-only* `PermissionEngine` for each child -- the
+    /// mechanism behind "permission scope typically stricter than parent"
+    /// (architecture §9): a child never even gets a reference to the
+    /// project/global policy stores, so it structurally cannot read or
+    /// write rules at those scopes, not just by runtime convention.
+    prompter: Arc<dyn PermissionPrompter>,
     config: AgentConfig,
 }
 
@@ -94,6 +173,7 @@ impl NativeAgentLoop {
         permission_engine: Arc<dyn PermissionEngine>,
         execution_plane: Arc<dyn ExecutionPlane>,
         pricing: Arc<lh_ledger::PricingTable>,
+        prompter: Arc<dyn PermissionPrompter>,
         config: AgentConfig,
     ) -> Self {
         Self {
@@ -102,6 +182,7 @@ impl NativeAgentLoop {
             permission_engine,
             execution_plane,
             pricing,
+            prompter,
             config,
         }
     }
@@ -127,7 +208,7 @@ impl NativeAgentLoop {
         .await?;
 
         let mut messages = vec![ChatMessage::user_text(user_text)];
-        let tools = builtin_tool_specs();
+        let tools = available_tool_specs(&self.config);
         let mut usage_acc = UsageAccumulator::default();
 
         for _ in 0..self.config.max_iterations {
@@ -278,9 +359,23 @@ impl NativeAgentLoop {
 
         let (status, output, is_error) = match &decision {
             PermissionDecision::Allow | PermissionDecision::AllowAlways { .. } => {
-                match self.execution_plane.execute(&call, &decision).await {
-                    Ok(out) => (ToolCallStatus::Completed, out, false),
-                    Err(e) => (ToolCallStatus::Failed, e.to_string(), true),
+                if tool_name == "spawn_subagent" {
+                    match TaskHandoff::from_tool_input(input) {
+                        Some(task) => match self.run_subagent(session_id, task).await {
+                            Ok(summary) => (ToolCallStatus::Completed, summary, false),
+                            Err(e) => (ToolCallStatus::Failed, e.to_string(), true),
+                        },
+                        None => (
+                            ToolCallStatus::Failed,
+                            "spawn_subagent requires 'role' and 'instructions'".to_string(),
+                            true,
+                        ),
+                    }
+                } else {
+                    match self.execution_plane.execute(&call, &decision).await {
+                        Ok(out) => (ToolCallStatus::Completed, out, false),
+                        Err(e) => (ToolCallStatus::Failed, e.to_string(), true),
+                    }
                 }
             }
             PermissionDecision::Deny | PermissionDecision::DenyAlways { .. } => {
@@ -300,6 +395,132 @@ impl NativeAgentLoop {
         .await?;
 
         Ok((output, is_error))
+    }
+
+    /// Runs one native subagent to completion as a child of `parent_session_id`
+    /// (architecture §9) -- the exact same session-tree, permission, and
+    /// cost machinery a delegated ACP agent uses (`lh-acp::delegate::
+    /// run_delegation`), just driven by another `NativeAgentLoop` in-process
+    /// instead of a subprocess round-trip. Returns the subagent's final
+    /// answer text (derived from its own event log, not carried out of
+    /// `run_turn` some other way -- consistent with "the event log is the
+    /// sole state-changing primitive").
+    async fn run_subagent(&self, parent_session_id: SessionId, task: TaskHandoff) -> Result<String> {
+        if self.config.subagent_depth >= MAX_SUBAGENT_DEPTH {
+            // Defense in depth: `available_tool_specs` already keeps this
+            // unreachable by not advertising `spawn_subagent` at max depth,
+            // but a caller that bypasses tool-spec filtering must still be
+            // refused here, structurally, not just by convention.
+            return Ok(format!(
+                "refused: subagent nesting depth {} would exceed the cap ({MAX_SUBAGENT_DEPTH})",
+                self.config.subagent_depth + 1
+            ));
+        }
+
+        let child_session_id = SessionId::now_v7();
+
+        // ChildSessionSpawned lands on the parent *before* the child's own
+        // first event -- the daemon's event forwarder discovers session-tree
+        // membership live by watching for this event (lh-daemon/src/main.rs),
+        // so a client attached to the parent needs to see it first.
+        self.emit(
+            parent_session_id,
+            Actor::System,
+            EventPayload::ChildSessionSpawned {
+                child: child_session_id,
+                kind: ChildKind::NativeSubagent { role: task.role.clone() },
+                spec: ChildSpec { task_summary: task.instructions.clone() },
+            },
+        )
+        .await?;
+        self.store
+            .append(Event::new(
+                child_session_id,
+                Some(parent_session_id),
+                Actor::System,
+                EventPayload::SessionDriverSet { driver: SessionDriver::Native },
+            ))
+            .await?;
+
+        // Session-scoped-only permission engine: a fresh `DefaultPermissionEngine`
+        // built directly from the prompter, never handed the project/global
+        // `TomlPolicyStore`s the parent's own engine has -- the child
+        // structurally cannot read or persist rules at those broader scopes
+        // (architecture §9's "permission scope typically stricter than
+        // parent," enforced by construction rather than a runtime check).
+        let child_permission_engine: Arc<dyn PermissionEngine> =
+            Arc::new(DefaultPermissionEngine::new(self.prompter.clone()));
+
+        let child_config = AgentConfig {
+            provider_name: self.config.provider_name.clone(),
+            model: self.config.model.clone(),
+            system_prompt: format!(
+                "You are a focused subagent spawned for one task: {}. Do the work, then give a \
+                 concise final answer summarizing what you found or did -- your answer is the \
+                 only thing the parent agent will see.",
+                task.role
+            ),
+            max_tokens: self.config.max_tokens,
+            max_iterations: task.max_turns.unwrap_or(self.config.max_iterations),
+            workspace_root: self.config.workspace_root.clone(),
+            tool_allowlist: task.tool_allowlist,
+            subagent_depth: self.config.subagent_depth + 1,
+        };
+
+        let child_loop = NativeAgentLoop::new(
+            self.store.clone(),
+            self.model_provider.clone(),
+            child_permission_engine,
+            self.execution_plane.clone(),
+            self.pricing.clone(),
+            self.prompter.clone(),
+            child_config,
+        );
+
+        // Boxed: run_turn -> handle_one_tool_call -> run_subagent -> run_turn
+        // is a real recursion cycle (a subagent's own turn can itself spawn
+        // a subagent, up to MAX_SUBAGENT_DEPTH) -- boxing this one edge
+        // gives the compiler a finite state-machine size to work with.
+        let turn_result = Box::pin(child_loop.run_turn(child_session_id, &task.instructions)).await;
+
+        // The subagent's answer is whatever text it produced, derived from
+        // its own event log -- not threaded out of `run_turn` some other
+        // way, matching how the cost ledger is always a derived read-model
+        // rather than carried state.
+        let summary = self.summarize_child_messages(child_session_id).await?;
+
+        let outcome = match &turn_result {
+            Ok(TurnOutcome::EndTurn) => ChildOutcome::Success { summary: summary.clone() },
+            Ok(TurnOutcome::MaxTurnsExceeded) => ChildOutcome::Failed {
+                message: format!("subagent exceeded its turn limit; partial answer: {summary}"),
+            },
+            Err(e) => ChildOutcome::Failed { message: e.to_string() },
+        };
+        self.emit(
+            parent_session_id,
+            Actor::System,
+            EventPayload::ChildSessionEnded { child: child_session_id, outcome: outcome.clone() },
+        )
+        .await?;
+
+        match outcome {
+            ChildOutcome::Success { summary } => Ok(summary),
+            ChildOutcome::Failed { message } => Ok(format!("subagent failed: {message}")),
+            ChildOutcome::Cancelled => Ok("subagent was cancelled".to_string()),
+        }
+    }
+
+    async fn summarize_child_messages(&self, child_session_id: SessionId) -> Result<String> {
+        let events = self.store.read_from(child_session_id, 0).await?;
+        let mut text = String::new();
+        for event in events {
+            if let EventPayload::AgentMessageChunk { content: ContentBlock::Text { text: chunk } } =
+                event.payload
+            {
+                text.push_str(&chunk);
+            }
+        }
+        Ok(if text.is_empty() { "(subagent produced no text response)".to_string() } else { text })
     }
 }
 
@@ -419,6 +640,19 @@ mod tests {
         }
     }
 
+    /// A `NativeAgentLoop` always needs a prompter now (it's what
+    /// `run_subagent` uses to build a child's own session-scoped
+    /// permission engine) even in tests that never spawn a subagent --
+    /// this fixed one mirrors `FixedDecisionEngine`.
+    struct FixedPrompter(PermissionDecision);
+
+    #[async_trait]
+    impl PermissionPrompter for FixedPrompter {
+        async fn ask(&self, _req: &PermissionRequest) -> lh_permission::Result<PermissionDecision> {
+            Ok(self.0.clone())
+        }
+    }
+
     fn text_response(text: &str) -> ModelResponse {
         ModelResponse {
             content: vec![ChatContent::Text(text.to_string())],
@@ -459,6 +693,7 @@ mod tests {
         let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
         let provider = Arc::new(ScriptedModelProvider::new(vec![text_response("hi there")]));
         let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
         let session_id = SessionId::now_v7();
 
         let agent = NativeAgentLoop::new(
@@ -467,6 +702,7 @@ mod tests {
             engine,
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -493,6 +729,7 @@ mod tests {
             text_response("the file says hello from disk"),
         ]));
         let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
         let session_id = SessionId::now_v7();
 
         let agent = NativeAgentLoop::new(
@@ -501,6 +738,7 @@ mod tests {
             engine,
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -551,6 +789,7 @@ mod tests {
             text_response("okay, I won't write that file"),
         ]));
         let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Deny));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Deny));
         let session_id = SessionId::now_v7();
 
         let agent = NativeAgentLoop::new(
@@ -559,6 +798,7 @@ mod tests {
             engine,
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -579,6 +819,167 @@ mod tests {
             unreachable!()
         };
         assert_eq!(*status, ToolCallStatus::Cancelled);
+    }
+
+    #[test]
+    fn available_tool_specs_respects_the_allowlist() {
+        let config = AgentConfig {
+            tool_allowlist: Some(vec!["read_file".to_string()]),
+            ..Default::default()
+        };
+        let names: Vec<String> = available_tool_specs(&config).into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["read_file".to_string()]);
+    }
+
+    #[test]
+    fn available_tool_specs_hides_spawn_subagent_past_max_depth() {
+        let mut config = AgentConfig { subagent_depth: MAX_SUBAGENT_DEPTH - 1, ..Default::default() };
+        let names: Vec<String> = available_tool_specs(&config).into_iter().map(|t| t.name).collect();
+        assert!(
+            names.iter().any(|n| n == "spawn_subagent"),
+            "one level below the cap should still allow spawning"
+        );
+
+        config.subagent_depth = MAX_SUBAGENT_DEPTH;
+        let names: Vec<String> = available_tool_specs(&config).into_iter().map(|t| t.name).collect();
+        assert!(
+            !names.iter().any(|n| n == "spawn_subagent"),
+            "at the cap, spawn_subagent must not be offered"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_subagent_refuses_at_max_depth_even_if_called_directly() {
+        // Defense in depth: available_tool_specs already keeps the model
+        // from calling this, but run_subagent itself must refuse too, in
+        // case that structural gate is ever bypassed.
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let provider = Arc::new(ScriptedModelProvider::new(vec![]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let session_id = SessionId::now_v7();
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                subagent_depth: MAX_SUBAGENT_DEPTH,
+                ..Default::default()
+            },
+        );
+
+        let result = agent
+            .run_subagent(
+                session_id,
+                TaskHandoff {
+                    role: "nested".to_string(),
+                    instructions: "should be refused".to_string(),
+                    tool_allowlist: None,
+                    max_turns: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("refused"), "expected a refusal message, got: {result}");
+
+        // Refused before ever touching the store's session tree for a child.
+        let events = store.read_from(session_id, 0).await.unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_subagent_is_spawned_and_its_answer_feeds_back_to_the_parent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let provider = Arc::new(ScriptedModelProvider::new(vec![
+            tool_use_response(
+                "call_1",
+                "spawn_subagent",
+                serde_json::json!({"role": "researcher", "instructions": "find the answer"}),
+            ),
+            text_response("42"),
+            text_response("The answer is 42."),
+        ]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let session_id = SessionId::now_v7();
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let outcome = agent.run_turn(session_id, "what's the answer?").await.unwrap();
+        assert_eq!(outcome, TurnOutcome::EndTurn);
+
+        let parent_events = store.read_from(session_id, 0).await.unwrap();
+        let parent_kinds: Vec<&str> = parent_events.iter().map(payload_kind).collect();
+        assert_eq!(
+            parent_kinds,
+            vec![
+                "UserMessage",
+                "ToolCallRequested",
+                "PermissionRequested",
+                "PermissionDecided",
+                "ChildSessionSpawned",
+                "ChildSessionEnded",
+                "ToolCallUpdated",
+                "AgentMessageChunk",
+                "UsageReported",
+            ]
+        );
+
+        let EventPayload::ChildSessionSpawned { child, kind, .. } = &parent_events[4].payload else {
+            panic!("expected ChildSessionSpawned");
+        };
+        assert!(matches!(kind, ChildKind::NativeSubagent { role } if role == "researcher"));
+        let child_session_id = *child;
+
+        let EventPayload::ChildSessionEnded { outcome, .. } = &parent_events[5].payload else {
+            panic!("expected ChildSessionEnded");
+        };
+        assert!(matches!(outcome, ChildOutcome::Success { summary } if summary == "42"));
+
+        let EventPayload::ToolCallUpdated { status, output, .. } = &parent_events[6].payload else {
+            panic!("expected ToolCallUpdated");
+        };
+        assert_eq!(*status, ToolCallStatus::Completed);
+        let ContentBlock::Text { text } = output.as_ref().unwrap() else {
+            panic!("expected text output");
+        };
+        assert_eq!(text, "42", "the subagent's answer must be what feeds back to the parent's model");
+
+        // The child got its own fresh session -- never the parent's transcript.
+        let child_events = store.read_from(child_session_id, 0).await.unwrap();
+        let child_kinds: Vec<&str> = child_events.iter().map(payload_kind).collect();
+        assert_eq!(child_kinds, vec!["SessionDriverSet", "UserMessage", "AgentMessageChunk", "UsageReported"]);
+        let EventPayload::UserMessage { content } = &child_events[1].payload else {
+            panic!("expected UserMessage");
+        };
+        let ContentBlock::Text { text } = &content[0] else { panic!("expected text") };
+        assert_eq!(text, "find the answer", "child sees only its own instructions, not the parent's prompt");
+
+        // Visible in the session tree, correctly attributed to the child.
+        let tree = store.session_tree(session_id).await.unwrap();
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].session_id, child_session_id);
+        assert!(matches!(tree.children[0].driver, Some(SessionDriver::Native)));
     }
 
     fn payload_kind(event: &Event) -> &'static str {

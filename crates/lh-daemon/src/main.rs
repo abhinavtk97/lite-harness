@@ -239,8 +239,13 @@ async fn handle_connection(
     let forwarded_seq = spawn_event_forwarder(store.clone(), session_id, write_half.clone());
 
     let prompter = SocketPrompter::new(write_half.clone());
+    // Shared with `NativeAgentLoop` too (not just the engine below): native
+    // subagents (architecture §9) build their own, session-scoped-only
+    // engine straight from this same prompter -- see
+    // `NativeAgentLoop::run_subagent`.
+    let shared_prompter: Arc<dyn lh_permission::PermissionPrompter> = Arc::new(prompter.clone());
     let permission_engine: Arc<dyn PermissionEngine> = Arc::new(DefaultPermissionEngine::with_policy_stores(
-        Arc::new(prompter.clone()),
+        shared_prompter.clone(),
         Arc::new(SessionPolicyStore::new()),
         project_policy,
         global_policy,
@@ -260,6 +265,7 @@ async fn handle_connection(
                     &permission_engine,
                     &execution_plane,
                     &pricing,
+                    &shared_prompter,
                     &write_half,
                     forwarded_seq.clone(),
                 )
@@ -318,6 +324,7 @@ async fn handle_session_prompt(
     permission_engine: &Arc<dyn PermissionEngine>,
     execution_plane: &Arc<dyn ExecutionPlane>,
     pricing: &Arc<PricingTable>,
+    prompter: &Arc<dyn lh_permission::PermissionPrompter>,
     write_half: &SharedWriter,
     forwarded_seq: tokio::sync::watch::Receiver<Option<u64>>,
 ) -> Result<()> {
@@ -334,6 +341,7 @@ async fn handle_session_prompt(
         permission_engine.clone(),
         execution_plane.clone(),
         pricing.clone(),
+        prompter.clone(),
         AgentConfig {
             provider_name: name.clone(),
             model: model.clone(),

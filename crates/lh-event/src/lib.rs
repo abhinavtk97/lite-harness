@@ -192,6 +192,11 @@ pub enum PermissionAction {
     DelegatedAgentToolCall { agent: AgentKind, acp_tool_call: Box<ToolCall> },
     /// §12.2 — delegation itself flows through the same permission gate.
     DelegateAgent { target: AgentKind, task_summary: String },
+    /// §9 — spawning a native subagent is itself a gated action, with its
+    /// own dedicated policy lever (e.g. "always ask before spawning
+    /// subagents"), independent of the risk tier of whatever the subagent
+    /// ends up doing internally.
+    SpawnSubagent { role: String, task_summary: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

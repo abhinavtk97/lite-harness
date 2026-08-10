@@ -91,6 +91,7 @@ pub fn policy_key(request: &PermissionRequest) -> PolicyKey {
         PermissionAction::McpToolCall { .. } => "mcp_tool_call",
         PermissionAction::DelegatedAgentToolCall { .. } => "delegated_agent_tool_call",
         PermissionAction::DelegateAgent { .. } => "delegate_agent",
+        PermissionAction::SpawnSubagent { .. } => "spawn_subagent",
     };
     format!("{source}#{action}")
 }
