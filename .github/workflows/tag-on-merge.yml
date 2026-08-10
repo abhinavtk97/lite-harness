@@ -1,0 +1,67 @@
+name: tag-on-merge
+
+# Every push to main (i.e. every merge) gets an automatic patch-version
+# bump: v0.0.1 -> v0.0.2 -> v0.0.3, etc. Skips if HEAD is already tagged
+# (avoids double-tagging on a re-run of the same commit). The tag job then
+# calls release.yml directly as a reusable workflow rather than relying on
+# its `push: tags` trigger -- a tag pushed with the default GITHUB_TOKEN
+# does not fire other workflows' push events, so a direct call is what
+# actually gets the release build running (see release.yml's own comment).
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-on-merge
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.next }}
+      tagged: ${{ steps.version.outputs.tagged }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next patch version and push the tag
+        id: version
+        run: |
+          set -euo pipefail
+
+          if [ -n "$(git tag --points-at HEAD)" ]; then
+            echo "HEAD is already tagged -- skipping"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
+          if [ -z "$latest" ]; then
+            next="v0.0.1"
+          else
+            IFS='.' read -r major minor patch <<< "${latest#v}"
+            next="v${major}.${minor}.$((patch + 1))"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$next" -m "$next"
+          git push origin "$next"
+
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "tagged=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: tag
+    if: needs.tag.outputs.tagged == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.tag.outputs.version }}

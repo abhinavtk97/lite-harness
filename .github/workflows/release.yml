@@ -1,12 +1,29 @@
 name: release
 
 # Builds lite-harness / lite-harnessd release binaries and attaches them to
-# a GitHub Release whenever a version tag is pushed. Windows is out of
-# scope for v1 (see docs/architecture) so only Linux and macOS are built.
+# a GitHub Release. Windows is out of scope for v1 (see docs/architecture)
+# so only Linux and macOS are built.
+#
+# Two ways in:
+#   - `push: tags: v*.*.*` -- a human (or any token that isn't the default
+#     GITHUB_TOKEN) pushes a version tag directly.
+#   - `workflow_call` -- invoked by tag-on-merge.yml right after it creates
+#     the tag. This exists because a workflow that pushes a tag using the
+#     default GITHUB_TOKEN does NOT trigger other workflows' `push: tags`
+#     events (a deliberate GitHub Actions anti-recursion rule) -- calling
+#     this workflow directly, in the same run, sidesteps that instead of
+#     needing a separate PAT/secret just to make one tag push trigger
+#     another workflow.
 on:
   push:
     tags:
       - "v*.*.*"
+  workflow_call:
+    inputs:
+      version:
+        description: "Version tag to build and release (e.g. v0.0.2) -- required when called via workflow_call, since that context doesn't set GITHUB_REF_NAME to the tag the way a real tag-push event does."
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -30,6 +47,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -44,7 +63,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME}"
+          version="${{ inputs.version || github.ref_name }}"
           stage="lite-harness-${version}-${{ matrix.name }}"
           mkdir "$stage"
           cp "target/${{ matrix.target }}/release/lite-harness" "$stage/"
@@ -71,5 +90,6 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.version || github.ref_name }}
           files: dist/*
           generate_release_notes: true
