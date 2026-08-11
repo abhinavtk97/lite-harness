@@ -1,7 +1,8 @@
 name: release
 
-# Builds lite-harness / lite-harnessd release binaries and attaches them to
-# a GitHub Release. Windows is out of scope for v1 (see docs/architecture)
+# Builds lite-harness / lite-harnessd / lite-harness-tui / lite-harness-web
+# release binaries and attaches them to a GitHub Release. Windows is out of
+# scope for v1 (see docs/architecture)
 # so only Linux and macOS are built. macOS is Apple Silicon (aarch64) only
 # -- the free-tier Intel (x86_64) hosted runner (macos-13) was observed
 # stuck "queued" with no runner ever assigned (confirmed live, not assumed:
@@ -61,7 +62,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} -p lh-cli -p lh-daemon
+        run: cargo build --release --target ${{ matrix.target }} -p lh-cli -p lh-daemon -p lh-tui -p lh-web-backend
 
       - name: Package
         shell: bash
@@ -72,6 +73,31 @@ jobs:
           mkdir "$stage"
           cp "target/${{ matrix.target }}/release/lite-harness" "$stage/"
           cp "target/${{ matrix.target }}/release/lite-harnessd" "$stage/"
+          cp "target/${{ matrix.target }}/release/lite-harness-tui" "$stage/"
+          cp "target/${{ matrix.target }}/release/lite-harness-web" "$stage/"
+          # lite-harness-web's default static-file path is baked in at
+          # compile time as `$CARGO_MANIFEST_DIR/../lh-web-ui` (see
+          # crates/lh-web-backend/src/main.rs) -- meaningless once the
+          # binary leaves the CI runner it was built on, so the UI's
+          # source files ship alongside it here instead, with a pointer
+          # to the env var that makes a downloaded release actually find
+          # them.
+          cp -r crates/lh-web-ui "$stage/lh-web-ui"
+          cat > "$stage/README.txt" <<'EOF'
+          lite-harness release bundle
+          ============================
+
+          lite-harness        one-shot CLI (spawns lite-harnessd if needed)
+          lite-harnessd       the daemon
+          lite-harness-tui    interactive terminal UI
+          lite-harness-web    browser UI backend + static assets (lh-web-ui/)
+
+          lite-harness-web serves its UI from LITE_HARNESS_WEB_STATIC_DIR,
+          which is NOT set by default in a downloaded release build. Run it
+          from this directory, or set the variable explicitly, e.g.:
+
+              LITE_HARNESS_WEB_STATIC_DIR=./lh-web-ui ./lite-harness-web
+          EOF
           tar czf "${stage}.tar.gz" "$stage"
           shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
 
