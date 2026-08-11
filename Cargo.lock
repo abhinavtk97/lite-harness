@@ -1255,7 +1255,11 @@ dependencies = [
  "axum",
  "futures",
  "lh-protocol",
+ "reqwest",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower-http",
 ]
 

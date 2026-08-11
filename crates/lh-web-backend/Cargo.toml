@@ -14,3 +14,9 @@ anyhow.workspace = true
 futures.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-tungstenite = "0.29"
+reqwest.workspace = true
+serde_json.workspace = true
