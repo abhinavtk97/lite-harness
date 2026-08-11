@@ -24,3 +24,7 @@ tokio.workspace = true
 anyhow.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true

@@ -1098,7 +1098,9 @@ dependencies = [
  "lh-protocol",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -1119,8 +1121,10 @@ dependencies = [
  "lh-store",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

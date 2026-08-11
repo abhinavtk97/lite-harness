@@ -53,3 +53,126 @@ pub fn resolve_default_provider() -> Result<Option<ResolvedProvider>> {
         model: cfg.default_model.clone(),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `providers_path`/`resolve_default_provider` read process-global env
+    /// vars (`LITE_HARNESS_PROVIDERS_FILE`, `LITE_HARNESS_PROVIDER`,
+    /// `HOME`) -- `cargo test` runs a binary crate's unit tests on multiple
+    /// threads by default, so every test here must serialize through this
+    /// lock and explicitly set every relevant var (never rely on another
+    /// test having left one unset).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_providers_toml(dir: &std::path::Path, contents: &str) -> std::path::PathBuf {
+        let path = dir.join("providers.toml");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn no_env_override_and_no_home_yields_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("LITE_HARNESS_PROVIDERS_FILE");
+        std::env::remove_var("LITE_HARNESS_PROVIDER");
+        std::env::remove_var("HOME");
+
+        assert!(providers_path().is_none());
+        assert!(resolve_default_provider().unwrap().is_none());
+    }
+
+    #[test]
+    fn providers_file_env_var_pointing_at_a_nonexistent_path_yields_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("LITE_HARNESS_PROVIDERS_FILE", "/definitely/does/not/exist/providers.toml");
+        std::env::remove_var("LITE_HARNESS_PROVIDER");
+        std::env::remove_var("HOME");
+
+        assert!(resolve_default_provider().unwrap().is_none());
+    }
+
+    #[test]
+    fn resolves_the_default_provider_from_the_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_providers_toml(
+            dir.path(),
+            "default = \"mock\"\n\n[[provider]]\nname = \"mock\"\nprotocol = \"open-ai-compatible\"\n\
+             base_url = \"http://127.0.0.1:1\"\napi_key_env = \"PROVIDERS_RS_TEST_KEY\"\ndefault_model = \"mock-model\"\n",
+        );
+        std::env::set_var("LITE_HARNESS_PROVIDERS_FILE", &path);
+        std::env::remove_var("LITE_HARNESS_PROVIDER");
+        std::env::set_var("PROVIDERS_RS_TEST_KEY", "sk-test");
+
+        let resolved = resolve_default_provider().unwrap().unwrap();
+        assert_eq!(resolved.name, "mock");
+        assert_eq!(resolved.model, "mock-model");
+    }
+
+    #[test]
+    fn provider_env_var_overrides_which_named_provider_is_used() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_providers_toml(
+            dir.path(),
+            "default = \"mock\"\n\n\
+             [[provider]]\nname = \"mock\"\nprotocol = \"open-ai-compatible\"\n\
+             base_url = \"http://127.0.0.1:1\"\napi_key_env = \"PROVIDERS_RS_TEST_KEY\"\ndefault_model = \"mock-model\"\n\n\
+             [[provider]]\nname = \"other\"\nprotocol = \"open-ai-compatible\"\n\
+             base_url = \"http://127.0.0.1:2\"\napi_key_env = \"PROVIDERS_RS_TEST_KEY\"\ndefault_model = \"other-model\"\n",
+        );
+        std::env::set_var("LITE_HARNESS_PROVIDERS_FILE", &path);
+        std::env::set_var("LITE_HARNESS_PROVIDER", "other");
+        std::env::set_var("PROVIDERS_RS_TEST_KEY", "sk-test");
+
+        let resolved = resolve_default_provider().unwrap().unwrap();
+        assert_eq!(resolved.name, "other");
+        assert_eq!(resolved.model, "other-model");
+    }
+
+    #[test]
+    fn an_unknown_named_provider_is_a_clear_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_providers_toml(
+            dir.path(),
+            "default = \"mock\"\n\n[[provider]]\nname = \"mock\"\nprotocol = \"open-ai-compatible\"\n\
+             base_url = \"http://127.0.0.1:1\"\napi_key_env = \"PROVIDERS_RS_TEST_KEY\"\ndefault_model = \"mock-model\"\n",
+        );
+        std::env::set_var("LITE_HARNESS_PROVIDERS_FILE", &path);
+        std::env::set_var("LITE_HARNESS_PROVIDER", "nonexistent");
+
+        assert!(resolve_default_provider().is_err());
+    }
+
+    #[test]
+    fn malformed_toml_is_a_clear_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_providers_toml(dir.path(), "this is not valid toml [[[");
+        std::env::set_var("LITE_HARNESS_PROVIDERS_FILE", &path);
+        std::env::remove_var("LITE_HARNESS_PROVIDER");
+
+        assert!(resolve_default_provider().is_err());
+    }
+
+    #[test]
+    fn missing_api_key_env_var_surfaces_as_an_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_providers_toml(
+            dir.path(),
+            "default = \"mock\"\n\n[[provider]]\nname = \"mock\"\nprotocol = \"open-ai-compatible\"\n\
+             base_url = \"http://127.0.0.1:1\"\napi_key_env = \"PROVIDERS_RS_TEST_KEY_DEFINITELY_UNSET\"\n\
+             default_model = \"mock-model\"\n",
+        );
+        std::env::set_var("LITE_HARNESS_PROVIDERS_FILE", &path);
+        std::env::remove_var("LITE_HARNESS_PROVIDER");
+        std::env::remove_var("PROVIDERS_RS_TEST_KEY_DEFINITELY_UNSET");
+
+        assert!(resolve_default_provider().is_err());
+    }
+}
