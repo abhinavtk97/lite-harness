@@ -114,7 +114,7 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
 /// sessions) the transcript alone fills the whole row, exactly like before
 /// this phase -- it only appears once there's something worth showing.
 fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
-    if app.plan_steps.is_empty() && app.child_sessions.is_empty() {
+    if app.plan_steps.is_empty() && app.child_sessions.is_empty() && app.background_bash.is_empty() {
         draw_transcript(frame, area, app);
         return;
     }
@@ -159,6 +159,25 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 Some(ChildOutcome::Cancelled) => ("cancelled", Style::default().fg(Color::DarkGray)),
             };
             lines.push(Line::from(Span::styled(format!("{mark} {label}"), style)));
+        }
+    }
+
+    if !app.background_bash.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled("background", Style::default().add_modifier(Modifier::BOLD))));
+        for proc in &app.background_bash {
+            let (mark, style) = if proc.running {
+                ("running", Style::default().fg(Color::Yellow))
+            } else {
+                ("done", Style::default().fg(Color::Green))
+            };
+            // Bash ids are full UUIDs (see `handle_one_tool_call`'s
+            // `bash_background` arm) -- an 8-char prefix is plenty to tell
+            // entries apart in a 30-column sidebar without wrapping.
+            let short_id = proc.id.get(..8).unwrap_or(&proc.id);
+            lines.push(Line::from(Span::styled(format!("{mark} {short_id}"), style)));
         }
     }
 
@@ -466,6 +485,29 @@ mod tests {
         app.child_sessions[0].outcome = Some(lh_event::ChildOutcome::Success { summary: "done".to_string() });
         let finished = render(&app);
         assert!(buffer_contains(&finished, "ok subagent:researcher"));
+    }
+
+    #[test]
+    fn a_background_bash_process_shows_its_running_then_done_state_in_the_sidebar() {
+        let mut app = App::new();
+        app.background_bash.push(crate::app::BackgroundBash { id: "abcdef01-2345-6789".to_string(), running: true });
+
+        let running = render(&app);
+        assert!(buffer_contains(&running, "background"));
+        assert!(buffer_contains(&running, "running abcdef01"));
+
+        app.background_bash[0].running = false;
+        let done = render(&app);
+        assert!(buffer_contains(&done, "done abcdef01"));
+    }
+
+    #[test]
+    fn a_lone_background_bash_process_is_enough_to_show_the_sidebar_on_its_own() {
+        let mut app = App::new();
+        app.background_bash.push(crate::app::BackgroundBash { id: "xyz".to_string(), running: true });
+
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "activity"), "no plan, no child sessions, but background alone must still show it");
     }
 
     #[test]

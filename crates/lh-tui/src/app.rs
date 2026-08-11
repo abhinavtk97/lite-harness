@@ -4,6 +4,8 @@
 //! terminal at all (see `tests` below) and `ui::draw` testable against
 //! `ratatui::backend::TestBackend` with no daemon connection.
 
+use std::collections::HashMap;
+
 use lh_event::{
     ChildKind, ChildOutcome, ContentBlock, Event, EventPayload, PermissionAction, PermissionDecision, PermissionRequest,
     PlanStep, PolicyScope, SessionId, ToolCallStatus,
@@ -106,6 +108,37 @@ pub struct ChildSessionInfo {
     pub outcome: Option<ChildOutcome>,
 }
 
+/// A `bash_background` process, tracked for the sidebar's live indicator --
+/// `running` flips to `false` once a `bash_wait` or `bash_kill` call for
+/// this same id completes (`bash_output` just peeks, so it never changes
+/// this). There's no equivalent tracker for ACP `terminal/*` sessions: those
+/// are raw ACP protocol calls between the daemon and a delegated agent
+/// subprocess, and `lh-acp` doesn't surface them as `ToolCallRequested`/
+/// `ToolCallUpdated` Harness events the way native tools do -- nothing here
+/// could observe them without a `lh-acp` change, which is out of scope for
+/// a TUI-only phase (see the plan doc's "write a UI, don't extend the
+/// core" decision).
+#[derive(Debug, Clone)]
+pub struct BackgroundBash {
+    pub id: String,
+    pub running: bool,
+}
+
+/// What `App` needs to remember about an in-flight tool call between its
+/// `ToolCallRequested` and matching `ToolCallUpdated` in order to maintain
+/// `background_bash` -- keyed by `call_id`, discarded once the matching
+/// `ToolCallUpdated` arrives. Not part of any rendered state itself.
+#[derive(Debug, Clone)]
+enum PendingToolCall {
+    /// Its `ToolCallUpdated.output` (once it arrives) *is* the new
+    /// background process's id -- see `lh-native-agent`'s `handle_one_tool_call`.
+    BashBackground,
+    /// `bash_wait`/`bash_kill` both target an already-running process by id
+    /// (parsed from the request's own `raw_args`); either one completing
+    /// means that process is no longer running.
+    BashWaitOrKill { bash_id: String },
+}
+
 pub struct App {
     pub phase: ConnPhase,
     pub transcript: Vec<TranscriptItem>,
@@ -144,6 +177,18 @@ pub struct App {
     /// Populated once, from the `agents/list` round trip that's part of
     /// the handshake (see `PendingKind::AgentsList`) -- backs `/agents`.
     pub available_agents: Vec<AgentInfo>,
+    /// Still-running and finished `bash_background` processes, oldest
+    /// first -- rendered as the sidebar's background-process indicator.
+    pub background_bash: Vec<BackgroundBash>,
+    /// Bookkeeping for `background_bash`; see `PendingToolCall`.
+    pending_tool_calls: HashMap<String, PendingToolCall>,
+    /// The `session_id` of the most recently applied event, used only to
+    /// decide whether a new `AgentMessageChunk`/`AgentThoughtChunk` should
+    /// merge into the last transcript bubble -- two chunks from *different*
+    /// sessions (e.g. the root and a delegated child interleaving) must
+    /// never merge into one bubble, even if both happen to be `Agent`
+    /// chunks back to back.
+    last_event_session: Option<SessionId>,
 }
 
 impl App {
@@ -164,6 +209,9 @@ impl App {
             last_ledger: None,
             primary: PrimarySelector::Native,
             available_agents: Vec::new(),
+            background_bash: Vec::new(),
+            pending_tool_calls: HashMap::new(),
+            last_event_session: None,
         }
     }
 
@@ -182,6 +230,14 @@ impl App {
     }
 
     pub fn apply_session_event(&mut self, event: &Event) {
+        // Two different sessions' `Agent` chunks landing back to back (e.g.
+        // the root and a delegated child interleaving) must never merge
+        // into one bubble -- captured *before* `last_event_session` is
+        // overwritten below, so it still reflects the *previous* event.
+        let same_session_as_last = self.last_event_session == Some(event.session_id);
+        self.last_event_session = Some(event.session_id);
+        let tag = self.session_tag(event.session_id);
+
         match &event.payload {
             // We already pushed our own `User` transcript item locally the
             // moment the prompt was sent -- the daemon's own echo of it
@@ -190,38 +246,65 @@ impl App {
             EventPayload::AgentMessageChunk { content } => {
                 let text = render_content(content);
                 match self.transcript.last_mut() {
-                    Some(TranscriptItem::Agent(buf)) => buf.push_str(&text),
-                    _ => self.transcript.push(TranscriptItem::Agent(text)),
+                    Some(TranscriptItem::Agent(buf)) if same_session_as_last => buf.push_str(&text),
+                    _ => self.transcript.push(TranscriptItem::Agent(format!("{tag}{text}"))),
                 }
             }
             EventPayload::AgentThoughtChunk { content } => {
                 let text = render_content(content);
                 match self.transcript.last_mut() {
-                    Some(TranscriptItem::Thought(buf)) => buf.push_str(&text),
-                    _ => self.transcript.push(TranscriptItem::Thought(text)),
+                    Some(TranscriptItem::Thought(buf)) if same_session_as_last => buf.push_str(&text),
+                    _ => self.transcript.push(TranscriptItem::Thought(format!("{tag}{text}"))),
                 }
             }
             EventPayload::ToolCallRequested { call } => {
+                let pending = match call.tool_name.as_str() {
+                    "bash_background" => Some(PendingToolCall::BashBackground),
+                    "bash_wait" | "bash_kill" => call
+                        .raw_args
+                        .get("bash_id")
+                        .and_then(|v| v.as_str())
+                        .map(|id| PendingToolCall::BashWaitOrKill { bash_id: id.to_string() }),
+                    _ => None,
+                };
+                if let Some(pending) = pending {
+                    self.pending_tool_calls.insert(call.call_id.clone(), pending);
+                }
                 self.transcript.push(TranscriptItem::ToolCall {
-                    tool_name: call.tool_name.clone(),
+                    tool_name: format!("{tag}{}", call.tool_name),
                     source: source_label(&call.source),
                 });
             }
-            EventPayload::ToolCallUpdated { status, .. } => {
+            EventPayload::ToolCallUpdated { call_id, status, output } => {
+                if let Some(pending) = self.pending_tool_calls.remove(call_id) {
+                    match pending {
+                        PendingToolCall::BashBackground if *status == ToolCallStatus::Completed => {
+                            if let Some(ContentBlock::Text { text }) = output {
+                                self.background_bash.push(BackgroundBash { id: text.clone(), running: true });
+                            }
+                        }
+                        PendingToolCall::BashWaitOrKill { bash_id } => {
+                            if let Some(entry) = self.background_bash.iter_mut().find(|b| b.id == bash_id) {
+                                entry.running = false;
+                            }
+                        }
+                        PendingToolCall::BashBackground => {}
+                    }
+                }
                 self.transcript.push(TranscriptItem::ToolCallUpdate { status: *status });
             }
             EventPayload::PermissionDecided { decision, .. } => {
-                self.transcript.push(TranscriptItem::System(format!("permission: {decision:?}")));
+                self.transcript.push(TranscriptItem::System(format!("{tag}permission: {decision:?}")));
             }
             EventPayload::UsageReported { usage } => {
                 let cost = usage.cost_usd.map(|c| format!("${c:.4}")).unwrap_or_else(|| "$?".to_string());
                 self.transcript.push(TranscriptItem::System(format!(
-                    "usage: {cost} ({:?}, {}ms)",
+                    "{tag}usage: {cost} ({:?}, {}ms)",
                     usage.confidence, usage.wall_ms
                 )));
             }
             EventPayload::SessionDriverSet { driver } => {
-                self.transcript.push(TranscriptItem::System(format!("driver: {driver:?}")));
+                self.transcript.push(TranscriptItem::System(format!("{tag}driver: {driver:?}")));
             }
             EventPayload::PlanUpdated { steps } => {
                 self.plan_steps = steps.clone();
@@ -236,7 +319,7 @@ impl App {
             }
             EventPayload::Error { message, recoverable } => {
                 self.transcript.push(TranscriptItem::Error(format!(
-                    "{message}{}",
+                    "{tag}{message}{}",
                     if *recoverable { " (recoverable)" } else { "" }
                 )));
             }
@@ -245,6 +328,27 @@ impl App {
             // SessionResumed have no v1 UI use yet (no resume flow exists --
             // see the plan doc's Phase 8 stretch goal).
             _ => {}
+        }
+    }
+
+    /// `""` for the root session; a short bracketed label (e.g.
+    /// `"[subagent:researcher] "`) for anything else, so a child session's
+    /// transcript lines read as visually distinct from the root's own --
+    /// falls back to a generic `"[child] "` if the session isn't (yet)
+    /// in `child_sessions`, rather than silently rendering it as if it
+    /// were the root (`ChildSessionSpawned`, which populates that list, is
+    /// always emitted on the parent before the child's own events start
+    /// flowing, so this fallback is defensive, not expected in practice).
+    fn session_tag(&self, session_id: SessionId) -> String {
+        if Some(session_id) == self.session_id {
+            return String::new();
+        }
+        match self.child_sessions.iter().find(|c| c.id == session_id) {
+            Some(child) => match &child.kind {
+                ChildKind::NativeSubagent { role } => format!("[subagent:{role}] "),
+                ChildKind::Delegated { agent } => format!("[delegated:{agent:?}] "),
+            },
+            None => "[child] ".to_string(),
         }
     }
 
@@ -345,13 +449,32 @@ mod tests {
     use super::*;
     use lh_event::{Actor, SessionId, UsageConfidence, UsageDelta};
 
+    /// A fixed id (not a fresh random one per call) so tests that apply
+    /// several events in a row are all describing the *same* session --
+    /// matching real usage, where `apply_session_event` only ever runs
+    /// once `App::session_id` is known, and needed since `session_tag`
+    /// (and the merge-across-sessions guard) now key off whether an
+    /// event's `session_id` matches `App::session_id`.
+    fn root_session_id() -> SessionId {
+        SessionId::nil()
+    }
+
     fn event(payload: EventPayload) -> Event {
-        Event::new(SessionId::now_v7(), None, Actor::Agent, payload)
+        Event::new(root_session_id(), None, Actor::Agent, payload)
+    }
+
+    /// A fresh `App` already past the handshake (`session_id` set to
+    /// `root_session_id()`), for tests that call `apply_session_event`
+    /// directly without going through the real `session/create` round trip.
+    fn app_with_root_session() -> App {
+        let mut app = App::new();
+        app.session_id = Some(root_session_id());
+        app
     }
 
     #[test]
     fn consecutive_agent_message_chunks_accumulate_into_one_bubble() {
-        let mut app = App::new();
+        let mut app = app_with_root_session();
         app.apply_session_event(&event(EventPayload::AgentMessageChunk { content: ContentBlock::text("Hel") }));
         app.apply_session_event(&event(EventPayload::AgentMessageChunk { content: ContentBlock::text("lo") }));
 
@@ -362,7 +485,7 @@ mod tests {
 
     #[test]
     fn a_tool_call_interrupts_the_accumulating_agent_bubble() {
-        let mut app = App::new();
+        let mut app = app_with_root_session();
         app.apply_session_event(&event(EventPayload::AgentMessageChunk { content: ContentBlock::text("before") }));
         app.apply_session_event(&event(EventPayload::ToolCallRequested {
             call: lh_event::ToolCall {
@@ -383,7 +506,7 @@ mod tests {
 
     #[test]
     fn consecutive_agent_thought_chunks_accumulate_into_one_bubble() {
-        let mut app = App::new();
+        let mut app = app_with_root_session();
         app.apply_session_event(&event(EventPayload::AgentThoughtChunk { content: ContentBlock::text("thinking a") }));
         app.apply_session_event(&event(EventPayload::AgentThoughtChunk { content: ContentBlock::text("bout it") }));
 
@@ -394,7 +517,7 @@ mod tests {
 
     #[test]
     fn an_error_event_renders_recoverable_and_fatal_distinctly() {
-        let mut app = App::new();
+        let mut app = app_with_root_session();
         app.apply_session_event(&event(EventPayload::Error { message: "oops".to_string(), recoverable: true }));
         app.apply_session_event(&event(EventPayload::Error { message: "boom".to_string(), recoverable: false }));
 
@@ -406,7 +529,7 @@ mod tests {
 
     #[test]
     fn a_tool_call_from_an_mcp_or_acp_source_labels_it_correctly() {
-        let mut app = App::new();
+        let mut app = app_with_root_session();
         app.apply_session_event(&event(EventPayload::ToolCallRequested {
             call: lh_event::ToolCall {
                 call_id: "call_mcp".to_string(),
@@ -434,7 +557,7 @@ mod tests {
 
     #[test]
     fn an_other_content_block_renders_by_its_kind_tag() {
-        let mut app = App::new();
+        let mut app = app_with_root_session();
         app.apply_session_event(&event(EventPayload::AgentMessageChunk {
             content: ContentBlock::Other { kind: "image".to_string(), value: serde_json::json!({}) },
         }));
@@ -451,7 +574,7 @@ mod tests {
 
     #[test]
     fn usage_reported_renders_a_readable_summary_line() {
-        let mut app = App::new();
+        let mut app = app_with_root_session();
         app.apply_session_event(&event(EventPayload::UsageReported {
             usage: UsageDelta {
                 input_tokens: Some(10),
@@ -672,5 +795,169 @@ mod tests {
             outcome: ChildOutcome::Cancelled,
         }));
         assert!(app.child_sessions.is_empty());
+    }
+
+    fn tool_call(call_id: &str, tool_name: &str, raw_args: serde_json::Value) -> Event {
+        event(EventPayload::ToolCallRequested {
+            call: lh_event::ToolCall {
+                call_id: call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                source: lh_event::ToolSource::Native { tool_id: tool_name.to_string() },
+                args_summary: raw_args.clone(),
+                raw_args,
+            },
+        })
+    }
+
+    fn tool_call_completed(call_id: &str, output: &str) -> Event {
+        event(EventPayload::ToolCallUpdated {
+            call_id: call_id.to_string(),
+            status: ToolCallStatus::Completed,
+            output: Some(ContentBlock::text(output)),
+        })
+    }
+
+    #[test]
+    fn a_bash_background_call_starts_tracked_as_running() {
+        let mut app = app_with_root_session();
+        app.apply_session_event(&tool_call("call_1", "bash_background", serde_json::json!({ "command": "sleep 5" })));
+        app.apply_session_event(&tool_call_completed("call_1", "bash-id-123"));
+
+        assert_eq!(app.background_bash.len(), 1);
+        assert_eq!(app.background_bash[0].id, "bash-id-123");
+        assert!(app.background_bash[0].running);
+    }
+
+    #[test]
+    fn a_bash_wait_call_completing_marks_the_matching_process_as_finished() {
+        let mut app = app_with_root_session();
+        app.apply_session_event(&tool_call("call_1", "bash_background", serde_json::json!({ "command": "sleep 5" })));
+        app.apply_session_event(&tool_call_completed("call_1", "bash-id-123"));
+
+        app.apply_session_event(&tool_call("call_2", "bash_wait", serde_json::json!({ "bash_id": "bash-id-123" })));
+        app.apply_session_event(&tool_call_completed("call_2", "sleep 5\n"));
+
+        assert_eq!(app.background_bash.len(), 1, "must update in place, not add a second entry");
+        assert!(!app.background_bash[0].running);
+    }
+
+    #[test]
+    fn a_bash_kill_call_completing_also_marks_the_process_as_finished() {
+        let mut app = app_with_root_session();
+        app.apply_session_event(&tool_call("call_1", "bash_background", serde_json::json!({ "command": "sleep 5" })));
+        app.apply_session_event(&tool_call_completed("call_1", "bash-id-123"));
+
+        app.apply_session_event(&tool_call("call_2", "bash_kill", serde_json::json!({ "bash_id": "bash-id-123" })));
+        app.apply_session_event(&tool_call_completed("call_2", "killed"));
+
+        assert!(!app.background_bash[0].running);
+    }
+
+    #[test]
+    fn a_bash_output_call_does_not_change_the_running_state() {
+        let mut app = app_with_root_session();
+        app.apply_session_event(&tool_call("call_1", "bash_background", serde_json::json!({ "command": "sleep 5" })));
+        app.apply_session_event(&tool_call_completed("call_1", "bash-id-123"));
+
+        app.apply_session_event(&tool_call("call_2", "bash_output", serde_json::json!({ "bash_id": "bash-id-123" })));
+        app.apply_session_event(&tool_call_completed("call_2", "partial output"));
+
+        assert!(app.background_bash[0].running, "bash_output only peeks, it must not stop the process");
+    }
+
+    #[test]
+    fn a_malformed_bash_wait_call_with_no_bash_id_is_tracked_as_nothing_in_particular() {
+        let mut app = app_with_root_session();
+        // Missing `bash_id` entirely -- must not panic, and must not be
+        // mistaken for a `bash_background` start either.
+        app.apply_session_event(&tool_call("call_1", "bash_wait", serde_json::json!({})));
+        app.apply_session_event(&tool_call_completed("call_1", "bash-id-123"));
+
+        assert!(app.background_bash.is_empty());
+    }
+
+    #[test]
+    fn a_root_session_event_gets_no_tag_prefix() {
+        let mut app = app_with_root_session();
+        app.apply_session_event(&event(EventPayload::AgentMessageChunk { content: ContentBlock::text("hi") }));
+        let TranscriptItem::Agent(text) = &app.transcript[0] else { panic!("expected Agent") };
+        assert_eq!(text, "hi", "the root session's own events must not be tagged");
+    }
+
+    #[test]
+    fn a_native_subagent_childs_events_are_tagged_and_dont_merge_with_the_roots_bubble() {
+        let mut app = app_with_root_session();
+        let child_id = SessionId::now_v7();
+        app.apply_session_event(&event(EventPayload::ChildSessionSpawned {
+            child: child_id,
+            kind: ChildKind::NativeSubagent { role: "researcher".to_string() },
+            spec: lh_event::ChildSpec { task_summary: "look into it".to_string() },
+        }));
+        app.apply_session_event(&event(EventPayload::AgentMessageChunk { content: ContentBlock::text("root talking") }));
+
+        let child_event = Event::new(child_id, Some(root_session_id()), Actor::Agent, EventPayload::AgentMessageChunk {
+            content: ContentBlock::text("child talking"),
+        });
+        app.apply_session_event(&child_event);
+
+        // ChildSessionSpawned is silent bookkeeping (see its own match arm)
+        // -- just the root bubble, then a separate child bubble, not merged.
+        assert_eq!(app.transcript.len(), 2, "root bubble, then a separate child bubble, not merged");
+        let TranscriptItem::Agent(root_text) = &app.transcript[0] else { panic!("expected Agent") };
+        assert_eq!(root_text, "root talking");
+        let TranscriptItem::Agent(child_text) = &app.transcript[1] else { panic!("expected Agent") };
+        assert_eq!(child_text, "[subagent:researcher] child talking");
+    }
+
+    #[test]
+    fn a_delegated_childs_events_are_tagged_with_the_agent_kind() {
+        let mut app = app_with_root_session();
+        let child_id = SessionId::now_v7();
+        app.apply_session_event(&event(EventPayload::ChildSessionSpawned {
+            child: child_id,
+            kind: ChildKind::Delegated { agent: lh_event::AgentKind::ClaudeCode },
+            spec: lh_event::ChildSpec { task_summary: "fix it".to_string() },
+        }));
+        let child_event = Event::new(child_id, Some(root_session_id()), Actor::Agent, EventPayload::AgentMessageChunk {
+            content: ContentBlock::text("working on it"),
+        });
+        app.apply_session_event(&child_event);
+
+        let TranscriptItem::Agent(text) = &app.transcript[0] else { panic!("expected Agent") };
+        assert_eq!(text, "[delegated:ClaudeCode] working on it");
+    }
+
+    #[test]
+    fn an_event_from_a_session_not_yet_known_as_a_child_falls_back_to_a_generic_tag() {
+        let mut app = app_with_root_session();
+        let unknown_session = SessionId::now_v7();
+        let stray_event = Event::new(unknown_session, None, Actor::Agent, EventPayload::AgentMessageChunk {
+            content: ContentBlock::text("???"),
+        });
+        app.apply_session_event(&stray_event);
+
+        let TranscriptItem::Agent(text) = &app.transcript[0] else { panic!("expected Agent") };
+        assert_eq!(text, "[child] ???");
+    }
+
+    #[test]
+    fn consecutive_chunks_from_the_same_child_session_still_accumulate_into_one_bubble() {
+        let mut app = app_with_root_session();
+        let child_id = SessionId::now_v7();
+        app.apply_session_event(&event(EventPayload::ChildSessionSpawned {
+            child: child_id,
+            kind: ChildKind::NativeSubagent { role: "researcher".to_string() },
+            spec: lh_event::ChildSpec { task_summary: "look into it".to_string() },
+        }));
+        for text in ["Hel", "lo"] {
+            let child_event =
+                Event::new(child_id, Some(root_session_id()), Actor::Agent, EventPayload::AgentMessageChunk {
+                    content: ContentBlock::text(text),
+                });
+            app.apply_session_event(&child_event);
+        }
+
+        let TranscriptItem::Agent(text) = &app.transcript[0] else { panic!("expected Agent") };
+        assert_eq!(text, "[subagent:researcher] Hello", "still one bubble across two chunks from the same child");
     }
 }
