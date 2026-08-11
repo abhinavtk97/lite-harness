@@ -4,7 +4,7 @@
 //! terminal at all (see `tests` below) and `ui::draw` testable against
 //! `ratatui::backend::TestBackend` with no daemon connection.
 
-use lh_event::{ContentBlock, Event, EventPayload, PermissionDecision, ToolCallStatus};
+use lh_event::{ChildKind, ChildOutcome, ContentBlock, Event, EventPayload, PermissionDecision, PlanStep, SessionId, ToolCallStatus};
 use lh_protocol::RequestId;
 
 use crate::input::InputBox;
@@ -49,6 +49,15 @@ pub struct PendingPermission {
     pub request_id: RequestId,
 }
 
+/// A subagent or ACP-delegated child session, tracked for the sidebar's
+/// session tree -- `outcome` is `None` while it's still running.
+#[derive(Debug, Clone)]
+pub struct ChildSessionInfo {
+    pub id: SessionId,
+    pub kind: ChildKind,
+    pub outcome: Option<ChildOutcome>,
+}
+
 pub struct App {
     pub phase: ConnPhase,
     pub transcript: Vec<TranscriptItem>,
@@ -64,6 +73,18 @@ pub struct App {
     pub pending_permission: Option<PendingPermission>,
     pub should_quit: bool,
     pub status: String,
+    /// The most recent `PlanUpdated` snapshot -- replaces wholesale each
+    /// time rather than merging, matching how the event itself is defined
+    /// (a full `Vec<PlanStep>`, not a delta).
+    pub plan_steps: Vec<PlanStep>,
+    /// Subagents and ACP-delegated children spawned from this session,
+    /// oldest first -- rendered as the sidebar's session tree.
+    pub child_sessions: Vec<ChildSessionInfo>,
+    /// The id of an in-flight `ledger/query`, if any -- tracked separately
+    /// from `pending` because a ledger refresh must never gate input the
+    /// way `pending` does (see `dispatch::handle_client_event`).
+    pub pending_ledger_query: Option<RequestId>,
+    pub last_ledger: Option<lh_ledger::LedgerRollup>,
 }
 
 impl App {
@@ -78,6 +99,10 @@ impl App {
             pending_permission: None,
             should_quit: false,
             status: "connecting...".to_string(),
+            plan_steps: Vec::new(),
+            child_sessions: Vec::new(),
+            pending_ledger_query: None,
+            last_ledger: None,
         }
     }
 
@@ -137,6 +162,17 @@ impl App {
             EventPayload::SessionDriverSet { driver } => {
                 self.transcript.push(TranscriptItem::System(format!("driver: {driver:?}")));
             }
+            EventPayload::PlanUpdated { steps } => {
+                self.plan_steps = steps.clone();
+            }
+            EventPayload::ChildSessionSpawned { child, kind, .. } => {
+                self.child_sessions.push(ChildSessionInfo { id: *child, kind: kind.clone(), outcome: None });
+            }
+            EventPayload::ChildSessionEnded { child, outcome } => {
+                if let Some(info) = self.child_sessions.iter_mut().find(|c| c.id == *child) {
+                    info.outcome = Some(outcome.clone());
+                }
+            }
             EventPayload::Error { message, recoverable } => {
                 self.transcript.push(TranscriptItem::Error(format!(
                     "{message}{}",
@@ -144,10 +180,9 @@ impl App {
                 )));
             }
             // PermissionRequested is rendered implicitly by pending_permission
-            // going Some (see main's PermissionAsk handling), and the
-            // remaining variants (ChildSession*/SessionForked/SessionResumed/
-            // PlanUpdated) are deliberately not rendered yet -- sidebar/plan
-            // panel work lands in a later phase (see the plan doc).
+            // going Some (see main's PermissionAsk handling); SessionForked/
+            // SessionResumed have no v1 UI use yet (no resume flow exists --
+            // see the plan doc's Phase 8 stretch goal).
             _ => {}
         }
     }
@@ -386,5 +421,53 @@ mod tests {
         app.scroll_up(10);
         app.apply_session_event(&event(EventPayload::AgentMessageChunk { content: ContentBlock::text("more") }));
         assert_eq!(app.transcript_scroll, 10, "reading old context shouldn't get yanked away by new streaming output");
+    }
+
+    #[test]
+    fn plan_updated_replaces_the_whole_step_list_each_time() {
+        let mut app = App::new();
+        app.apply_session_event(&event(EventPayload::PlanUpdated {
+            steps: vec![lh_event::PlanStep { description: "step one".to_string(), status: lh_event::PlanStepStatus::Pending }],
+        }));
+        assert_eq!(app.plan_steps.len(), 1);
+
+        app.apply_session_event(&event(EventPayload::PlanUpdated {
+            steps: vec![
+                lh_event::PlanStep { description: "step one".to_string(), status: lh_event::PlanStepStatus::Completed },
+                lh_event::PlanStep { description: "step two".to_string(), status: lh_event::PlanStepStatus::InProgress },
+            ],
+        }));
+        assert_eq!(app.plan_steps.len(), 2, "a newer PlanUpdated replaces, not appends");
+        assert!(matches!(app.plan_steps[0].status, lh_event::PlanStepStatus::Completed));
+    }
+
+    #[test]
+    fn a_spawned_child_session_appears_running_then_gets_its_outcome_on_ended() {
+        let mut app = App::new();
+        let child_id = SessionId::now_v7();
+        app.apply_session_event(&event(EventPayload::ChildSessionSpawned {
+            child: child_id,
+            kind: ChildKind::NativeSubagent { role: "researcher".to_string() },
+            spec: lh_event::ChildSpec { task_summary: "look into it".to_string() },
+        }));
+        assert_eq!(app.child_sessions.len(), 1);
+        assert!(app.child_sessions[0].outcome.is_none(), "should start out running");
+
+        app.apply_session_event(&event(EventPayload::ChildSessionEnded {
+            child: child_id,
+            outcome: ChildOutcome::Success { summary: "done".to_string() },
+        }));
+        assert_eq!(app.child_sessions.len(), 1, "must update in place, not append a second entry");
+        assert!(matches!(app.child_sessions[0].outcome, Some(ChildOutcome::Success { .. })));
+    }
+
+    #[test]
+    fn ending_an_unknown_child_session_is_a_no_op() {
+        let mut app = App::new();
+        app.apply_session_event(&event(EventPayload::ChildSessionEnded {
+            child: SessionId::now_v7(),
+            outcome: ChildOutcome::Cancelled,
+        }));
+        assert!(app.child_sessions.is_empty());
     }
 }

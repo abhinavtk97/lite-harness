@@ -3,6 +3,7 @@
 //! what lets it be tested against `ratatui::backend::TestBackend` with no
 //! real terminal and no daemon connection (see `tests` below).
 
+use lh_event::{ChildKind, ChildOutcome, PlanStepStatus};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -16,6 +17,11 @@ use crate::app::{App, ConnPhase, TranscriptItem};
 /// crowds out the transcript entirely.
 const MAX_INPUT_LINES: u16 = 5;
 
+/// Fixed sidebar width -- wide enough for a plan step or a session id
+/// fragment without wrapping every other line, narrow enough to leave the
+/// transcript as the dominant pane.
+const SIDEBAR_WIDTH: u16 = 30;
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let input_lines = (app.input.line_count() as u16).min(MAX_INPUT_LINES);
     let chunks = Layout::default()
@@ -23,9 +29,66 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Min(3), Constraint::Length(input_lines + 2), Constraint::Length(1)])
         .split(frame.area());
 
-    draw_transcript(frame, chunks[0], app);
+    draw_main(frame, chunks[0], app);
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], app);
+}
+
+/// The sidebar is additive: with nothing to show yet (no plan, no child
+/// sessions) the transcript alone fills the whole row, exactly like before
+/// this phase -- it only appears once there's something worth showing.
+fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
+    if app.plan_steps.is_empty() && app.child_sessions.is_empty() {
+        draw_transcript(frame, area, app);
+        return;
+    }
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(SIDEBAR_WIDTH)])
+        .split(area);
+    draw_transcript(frame, cols[0], app);
+    draw_sidebar(frame, cols[1], app);
+}
+
+fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    if !app.plan_steps.is_empty() {
+        lines.push(Line::from(Span::styled("plan", Style::default().add_modifier(Modifier::BOLD))));
+        for step in &app.plan_steps {
+            let (mark, style) = match step.status {
+                PlanStepStatus::Completed => ("[x]", Style::default().fg(Color::Green)),
+                PlanStepStatus::InProgress => ("[.]", Style::default().fg(Color::Yellow)),
+                PlanStepStatus::Pending => ("[ ]", Style::default().fg(Color::DarkGray)),
+            };
+            lines.push(Line::from(Span::styled(format!("{mark} {}", step.description), style)));
+        }
+    }
+
+    if !app.child_sessions.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled("sessions", Style::default().add_modifier(Modifier::BOLD))));
+        for child in &app.child_sessions {
+            let label = match &child.kind {
+                ChildKind::NativeSubagent { role } => format!("subagent:{role}"),
+                ChildKind::Delegated { agent } => format!("acp:{agent:?}"),
+            };
+            let (mark, style) = match &child.outcome {
+                None => ("...", Style::default().fg(Color::Yellow)),
+                Some(ChildOutcome::Success { .. }) => ("ok", Style::default().fg(Color::Green)),
+                Some(ChildOutcome::Failed { .. }) => ("fail", Style::default().fg(Color::Red)),
+                Some(ChildOutcome::Cancelled) => ("cancelled", Style::default().fg(Color::DarkGray)),
+            };
+            lines.push(Line::from(Span::styled(format!("{mark} {label}"), style)));
+        }
+    }
+
+    let block = Block::default().borders(Borders::ALL).title(" activity ");
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
@@ -118,9 +181,17 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         ConnPhase::Connecting => "connecting",
         ConnPhase::Ready => "ready",
     };
+    let cost = app
+        .last_ledger
+        .as_ref()
+        .map(|rollup| match rollup.cost_usd {
+            Some(usd) => format!("${usd:.4}"),
+            None => "$?".to_string(),
+        })
+        .unwrap_or_else(|| "-".to_string());
     let line = Line::from(vec![
         Span::styled(format!(" {phase} "), Style::default().fg(Color::Green)),
-        Span::raw(format!("| session {session} | {} | Ctrl+C to quit", app.status)),
+        Span::raw(format!("| session {session} | cost {cost} | {} | Ctrl+C to quit", app.status)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -237,5 +308,61 @@ mod tests {
         let scrolled = render(&app);
         assert!(buffer_contains(&scrolled, "line-0"), "scrolled all the way up to the oldest content");
         assert!(!buffer_contains(&scrolled, "line-29"), "newest content scrolled out of view");
+    }
+
+    #[test]
+    fn with_nothing_to_show_the_sidebar_stays_hidden() {
+        let app = App::new();
+        let backend = render(&app);
+        assert!(!buffer_contains(&backend, "activity"), "no plan, no child sessions -- no sidebar yet");
+    }
+
+    #[test]
+    fn a_plan_renders_its_steps_with_status_markers_in_the_sidebar() {
+        let mut app = App::new();
+        app.plan_steps = vec![
+            lh_event::PlanStep { description: "write the tests".to_string(), status: lh_event::PlanStepStatus::Completed },
+            lh_event::PlanStep { description: "write the code".to_string(), status: lh_event::PlanStepStatus::InProgress },
+        ];
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "activity"));
+        assert!(buffer_contains(&backend, "[x] write the tests"));
+        assert!(buffer_contains(&backend, "[.] write the code"));
+    }
+
+    #[test]
+    fn a_child_session_shows_its_running_then_finished_state_in_the_sidebar() {
+        let mut app = App::new();
+        app.child_sessions.push(crate::app::ChildSessionInfo {
+            id: lh_event::SessionId::now_v7(),
+            kind: lh_event::ChildKind::NativeSubagent { role: "researcher".to_string() },
+            outcome: None,
+        });
+        let running = render(&app);
+        assert!(buffer_contains(&running, "subagent:researcher"));
+        assert!(buffer_contains(&running, "..."));
+
+        app.child_sessions[0].outcome = Some(lh_event::ChildOutcome::Success { summary: "done".to_string() });
+        let finished = render(&app);
+        assert!(buffer_contains(&finished, "ok subagent:researcher"));
+    }
+
+    #[test]
+    fn the_status_bar_shows_a_dash_until_a_ledger_rollup_arrives_then_the_cost() {
+        let mut app = App::new();
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "cost -"));
+
+        app.last_ledger = Some(lh_ledger::LedgerRollup {
+            session_id: lh_event::SessionId::now_v7(),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cost_usd: Some(0.0025),
+            turns: 1,
+            confidence: lh_event::UsageConfidence::Exact,
+            children: Vec::new(),
+        });
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "cost $0.0025"));
     }
 }

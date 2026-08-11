@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 lh-event = { path = "../lh-event" }
+lh-ledger = { path = "../lh-ledger" }
 lh-protocol = { path = "../lh-protocol" }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

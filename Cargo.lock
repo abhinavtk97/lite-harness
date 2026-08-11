@@ -1405,6 +1405,7 @@ dependencies = [
  "crossterm",
  "futures",
  "lh-event",
+ "lh-ledger",
  "lh-protocol",
  "ratatui",
  "serde_json",

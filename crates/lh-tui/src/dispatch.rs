@@ -38,6 +38,19 @@ pub async fn handle_client_event(
             app.pending_permission = Some(PendingPermission { request_id });
         }
         ClientEvent::Response(resp) => {
+            // A ledger refresh is fire-and-forget from the input-gating
+            // perspective (it must never block typing), so it's tracked in
+            // its own field rather than `app.pending` and handled first.
+            if app.pending_ledger_query == Some(resp.id) {
+                app.pending_ledger_query = None;
+                if let Some(result) = resp.result {
+                    if let Ok(parsed) = serde_json::from_value::<lh_protocol::LedgerQueryResult>(result) {
+                        app.last_ledger = Some(parsed.rollup);
+                    }
+                }
+                return Ok(());
+            }
+
             let Some((pending_id, kind)) = app.pending else { return Ok(()) };
             if resp.id != pending_id {
                 // Not what we're waiting on (e.g. a stray response to a
@@ -78,15 +91,14 @@ pub async fn handle_client_event(
                 PendingKind::Prompt => {
                     let result: SessionPromptResult = serde_json::from_value(result)?;
                     app.push_system(format!("turn complete: {}", result.stop_reason));
-                    // Fire-and-forget: not tracked in `pending` (it doesn't
-                    // gate input), so its Response falls through the
-                    // `!= pending_id` branch above and is ignored for now.
-                    // Rendering the ledger rollup lands with the
-                    // status-bar/cost-display phase.
+                    // Tracked in `pending_ledger_query`, not `pending` --
+                    // refreshing the cost rollup must never gate input the
+                    // way an in-flight prompt does.
                     if let Some(session_id) = app.session_id {
-                        let _ = client
+                        let query_id = client
                             .send_request(methods::LEDGER_QUERY, serde_json::to_value(LedgerQueryParams { session_id })?)
-                            .await;
+                            .await?;
+                        app.pending_ledger_query = Some(query_id);
                     }
                 }
             }
@@ -375,6 +387,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ctrl_backspace_also_deletes_the_word_before_the_cursor() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        for c in "run echo".chars() {
+            app.input.insert_char(c);
+        }
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)).await.unwrap();
+
+        assert_eq!(app.input.text(), "run ");
+    }
+
+    #[tokio::test]
     async fn ctrl_w_deletes_the_word_before_the_cursor() {
         let mut app = App::new();
         app.phase = ConnPhase::Ready;
@@ -433,6 +459,58 @@ mod tests {
 
         handle_key(&mut app, &mut client, key(KeyCode::PageDown)).await.unwrap();
         assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn a_ledger_query_response_updates_last_ledger_without_touching_pending() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending = Some((5, PendingKind::Prompt)); // a real prompt is still in flight
+        app.pending_ledger_query = Some(42);
+
+        let rollup = lh_ledger::LedgerRollup {
+            session_id: lh_event::SessionId::now_v7(),
+            input_tokens: Some(10),
+            output_tokens: Some(4),
+            cost_usd: Some(0.0012),
+            turns: 1,
+            confidence: lh_event::UsageConfidence::Exact,
+            children: Vec::new(),
+        };
+        let resp = Response::ok(42, serde_json::to_value(lh_protocol::LedgerQueryResult { rollup }).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert!(app.pending_ledger_query.is_none());
+        assert_eq!(app.pending, Some((5, PendingKind::Prompt)), "the real pending prompt must be untouched");
+        assert_eq!(app.last_ledger.unwrap().cost_usd, Some(0.0012));
+    }
+
+    #[tokio::test]
+    async fn a_ledger_query_response_that_fails_to_deserialize_is_ignored_not_fatal() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending_ledger_query = Some(42);
+
+        let resp = Response::ok(42, serde_json::json!({ "not": "a rollup" }));
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert!(app.pending_ledger_query.is_none(), "still clears the pending marker even on a malformed reply");
+        assert!(app.last_ledger.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_ledger_query_response_with_an_error_and_no_result_is_ignored_not_fatal() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending_ledger_query = Some(42);
+
+        let mut resp = Response::ok(42, serde_json::json!({}));
+        resp.result = None;
+        resp.error = Some(RpcError { code: -1, message: "session not found".to_string() });
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert!(app.pending_ledger_query.is_none());
+        assert!(app.last_ledger.is_none());
     }
 
     #[test]
