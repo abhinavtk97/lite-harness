@@ -194,6 +194,14 @@ pub async fn handle_connection(
     // session -- matching Claude Code's own BashOutput UX.
     let background_processes: lh_native_agent::BackgroundProcessRegistry =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    // Same lifetime story as `background_processes` above: a fresh
+    // NativeAgentLoop is built for every session/prompt call, but this Arc
+    // is the one shared thing across the whole connection, so turn 2 can
+    // see what was said and done in turn 1 -- otherwise every prompt is a
+    // context-free one-off from the model's point of view, even though the
+    // durable event log remembers everything.
+    let conversation_history: lh_native_agent::ConversationHistory =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // 4. steady state: session/prompt and permission/respond, interleaved.
     loop {
@@ -212,6 +220,7 @@ pub async fn handle_connection(
                             &pricing,
                             &shared_prompter,
                             &background_processes,
+                            &conversation_history,
                             &write_half,
                             forwarded_seq.clone(),
                         )
@@ -288,6 +297,7 @@ async fn handle_session_prompt(
     pricing: &Arc<PricingTable>,
     prompter: &Arc<dyn lh_permission::PermissionPrompter>,
     background_processes: &lh_native_agent::BackgroundProcessRegistry,
+    conversation_history: &lh_native_agent::ConversationHistory,
     write_half: &SharedWriter,
     forwarded_seq: tokio::sync::watch::Receiver<Option<u64>>,
 ) -> Result<()> {
@@ -306,6 +316,7 @@ async fn handle_session_prompt(
         pricing.clone(),
         prompter.clone(),
         background_processes.clone(),
+        conversation_history.clone(),
         AgentConfig {
             provider_name: name.clone(),
             model: model.clone(),

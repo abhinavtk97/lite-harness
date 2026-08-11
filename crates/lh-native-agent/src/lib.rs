@@ -51,6 +51,16 @@ use tokio::sync::Mutex as AsyncMutex;
 /// in the next (matching Claude Code's own BashOutput UX).
 pub type BackgroundProcessRegistry = Arc<AsyncMutex<HashMap<String, Arc<dyn BackgroundProcess>>>>;
 
+/// Shared, per-connection conversation memory, keyed by session id -- the
+/// exact same lifetime and ownership story as `BackgroundProcessRegistry`
+/// above (owned by whoever constructs `NativeAgentLoop`s across turns, not
+/// by the loop itself). Without this, every `session/prompt` call built a
+/// brand-new `messages` list from just that one call's text, so a
+/// multi-turn REPL (the TUI) could never answer a follow-up that depended
+/// on anything said earlier in the same session -- the durable event log
+/// remembered it, but the model was never shown it again.
+pub type ConversationHistory = Arc<AsyncMutex<HashMap<SessionId, Vec<ChatMessage>>>>;
+
 pub use tools::builtin_tool_specs;
 
 /// Structural cap on subagent nesting depth (a subagent spawning its own
@@ -178,10 +188,17 @@ pub struct NativeAgentLoop {
     /// context-isolation boundary the child's permission engine already
     /// enforces.
     background_processes: BackgroundProcessRegistry,
+    /// Cross-turn conversation memory -- see `ConversationHistory`. A
+    /// subagent gets its own fresh, empty map (`run_subagent`), same as its
+    /// background-process registry: each child spawns with a brand-new
+    /// `SessionId` anyway, so this only matters for the isolation story,
+    /// not for any turn actually finding prior history under that key.
+    conversation_history: ConversationHistory,
     config: AgentConfig,
 }
 
 impl NativeAgentLoop {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<dyn SessionStore>,
         model_provider: Arc<dyn ModelProvider>,
@@ -190,6 +207,7 @@ impl NativeAgentLoop {
         pricing: Arc<lh_ledger::PricingTable>,
         prompter: Arc<dyn PermissionPrompter>,
         background_processes: BackgroundProcessRegistry,
+        conversation_history: ConversationHistory,
         config: AgentConfig,
     ) -> Self {
         Self {
@@ -200,6 +218,7 @@ impl NativeAgentLoop {
             pricing,
             prompter,
             background_processes,
+            conversation_history,
             config,
         }
     }
@@ -224,7 +243,14 @@ impl NativeAgentLoop {
         )
         .await?;
 
-        let mut messages = vec![ChatMessage::user_text(user_text)];
+        let mut messages = self
+            .conversation_history
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        messages.push(ChatMessage::user_text(user_text));
         let tools = available_tool_specs(&self.config);
         let mut usage_acc = UsageAccumulator::default();
 
@@ -260,6 +286,18 @@ impl NativeAgentLoop {
                 .collect();
 
             if tool_uses.is_empty() {
+                // The final assistant reply belongs in history too -- it's
+                // never pushed into `messages` on this branch otherwise
+                // (only the tool-calling branch below does), so without
+                // this a follow-up turn would see everything *except* the
+                // answer it's actually asking about.
+                if !text.is_empty() {
+                    messages.push(ChatMessage {
+                        role: ChatRole::Assistant,
+                        content: vec![ChatContent::Text(text)],
+                    });
+                }
+                self.conversation_history.lock().await.insert(session_id, messages);
                 self.emit(
                     session_id,
                     Actor::System,
@@ -304,6 +342,7 @@ impl NativeAgentLoop {
             });
         }
 
+        self.conversation_history.lock().await.insert(session_id, messages);
         self.emit(
             session_id,
             Actor::System,
@@ -626,6 +665,10 @@ impl NativeAgentLoop {
             // leak across the same context-isolation boundary its
             // session-scoped-only permission engine already enforces.
             Arc::new(AsyncMutex::new(HashMap::new())),
+            // Fresh, empty history map too -- moot in practice since
+            // `child_session_id` above is always brand-new, but keeps the
+            // isolation story consistent with the registry above.
+            Arc::new(AsyncMutex::new(HashMap::new())),
             child_config,
         );
 
@@ -762,19 +805,25 @@ mod tests {
 
     struct ScriptedModelProvider {
         responses: AsyncMutex<VecDeque<ModelResponse>>,
+        // Every request this provider ever received, in order -- lets a
+        // test assert on what `messages` actually looked like by the time
+        // it reached the model, not just on the final observable outcome.
+        recorded_requests: AsyncMutex<Vec<ModelRequest>>,
     }
 
     impl ScriptedModelProvider {
         fn new(responses: Vec<ModelResponse>) -> Self {
             Self {
                 responses: AsyncMutex::new(responses.into_iter().collect()),
+                recorded_requests: AsyncMutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl ModelProvider for ScriptedModelProvider {
-        async fn complete(&self, _req: ModelRequest) -> lh_model_provider::Result<ModelResponse> {
+        async fn complete(&self, req: ModelRequest) -> lh_model_provider::Result<ModelResponse> {
+            self.recorded_requests.lock().await.push(req);
             self.responses
                 .lock()
                 .await
@@ -885,6 +934,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
             Arc::new(AsyncMutex::new(HashMap::new())),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -921,6 +971,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
@@ -978,6 +1029,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
@@ -1046,6 +1098,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
             Arc::new(AsyncMutex::new(HashMap::new())),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1093,6 +1146,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
@@ -1148,6 +1202,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
@@ -1221,6 +1276,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
             registry.clone(),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1293,6 +1349,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
             registry.clone(),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1348,6 +1405,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
             registry,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1376,6 +1434,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
             registry,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1408,6 +1467,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
             registry,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1441,6 +1501,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
             registry.clone(),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1468,6 +1529,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
@@ -1511,6 +1573,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
             Arc::new(AsyncMutex::new(HashMap::new())),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1544,6 +1607,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
@@ -1597,6 +1661,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
             Arc::new(AsyncMutex::new(HashMap::new())),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1648,6 +1713,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
@@ -1724,6 +1790,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
@@ -1840,6 +1907,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
             registry,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1896,6 +1964,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
             registry,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1945,6 +2014,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
             registry.clone(),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             config.clone(),
         );
         let (bash_id, _) = turn1
@@ -1965,6 +2035,7 @@ mod tests {
             Arc::new(lh_ledger::PricingTable::new()),
             Arc::new(FixedPrompter(PermissionDecision::Allow)),
             registry.clone(),
+            Arc::new(AsyncMutex::new(HashMap::new())),
             config,
         );
         let (output, is_error) = turn2
@@ -1973,6 +2044,84 @@ mod tests {
             .unwrap();
         assert!(!is_error, "a fresh NativeAgentLoop sharing the registry must still see the process turn1 started");
         assert!(output.contains("hi") || output.contains("still running"), "got: {output}");
+    }
+
+    #[tokio::test]
+    async fn a_second_turn_on_the_same_session_sees_the_first_turns_conversation() {
+        // The daemon's real shape (matches the registry test above): a
+        // fresh NativeAgentLoop per session/prompt call, but the
+        // ConversationHistory Arc shared across the whole connection. Before
+        // this fix, `run_turn` always started `messages` from just that
+        // call's text, so turn 2's model request would never include turn
+        // 1's question or answer -- a follow-up like "what did you just
+        // say?" had nothing to work with.
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let session_id = SessionId::now_v7();
+        let history: ConversationHistory = Arc::new(AsyncMutex::new(HashMap::new()));
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            workspace_root: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let turn1_provider = Arc::new(ScriptedModelProvider::new(vec![ModelResponse {
+            content: vec![ChatContent::Text("Paris is the capital.".to_string())],
+            usage: ModelUsage::default(),
+            stop_reason: StopReason::EndTurn,
+        }]));
+        let turn1 = NativeAgentLoop::new(
+            store.clone(),
+            turn1_provider,
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            history.clone(),
+            config.clone(),
+        );
+        turn1.run_turn(session_id, "What is the capital of France?").await.unwrap();
+
+        let turn2_provider = Arc::new(ScriptedModelProvider::new(vec![ModelResponse {
+            content: vec![ChatContent::Text("It has about 2 million people.".to_string())],
+            usage: ModelUsage::default(),
+            stop_reason: StopReason::EndTurn,
+        }]));
+        let turn2 = NativeAgentLoop::new(
+            store.clone(),
+            turn2_provider.clone(),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            history.clone(),
+            config,
+        );
+        turn2.run_turn(session_id, "How big is it?").await.unwrap();
+
+        let recorded = turn2_provider.recorded_requests.lock().await;
+        let request = &recorded[0];
+        assert_eq!(
+            request.messages.len(),
+            3,
+            "turn 2's request should carry turn 1's question + answer plus its own new question, got: {:?}",
+            request.messages
+        );
+        let joined_text: String = request
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                ChatContent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined_text.contains("capital of France"), "got: {joined_text}");
+        assert!(joined_text.contains("Paris is the capital"), "got: {joined_text}");
+        assert!(joined_text.contains("How big is it"), "got: {joined_text}");
     }
 
     fn payload_kind(event: &Event) -> &'static str {
