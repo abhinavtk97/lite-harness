@@ -177,3 +177,13 @@ OpenAI-compatible `/chat/completions` shape (point `providers.toml` at it
 with `protocol = "open-ai-compatible"`) rather than a live API key, and for
 the web UI, drives the real page with Playwright against a headless
 Chromium.
+
+### CI
+
+`cargo build --workspace` + `cargo test --workspace` run on both Linux and
+macOS (`.github/workflows/test.yml`) on every push and PR
+(`ci.yml`), and again as a hard gate in front of tagging/releasing
+(`tag-on-merge.yml`) -- a commit that fails either platform's test suite
+never gets auto-tagged or released. `clippy` also runs but is
+report-only for now (the workspace carries a few pre-existing warnings not
+yet cleaned up).

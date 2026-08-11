@@ -7,6 +7,12 @@ name: tag-on-merge
 # its `push: tags` trigger -- a tag pushed with the default GITHUB_TOKEN
 # does not fire other workflows' push events, so a direct call is what
 # actually gets the release build running (see release.yml's own comment).
+#
+# `tag` now depends on `test` (test.yml, the same build+test gate ci.yml
+# runs on every push/PR) so a commit that fails `cargo test --workspace`
+# on either platform can never be auto-tagged and released -- previously
+# nothing enforced that, tagging fired on every push to main regardless of
+# whether the build even compiled.
 on:
   push:
     branches:
@@ -20,7 +26,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/test.yml
+
   tag:
+    needs: test
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.next }}

@@ -1,0 +1,57 @@
+name: test
+
+# Reusable: the actual build+test gate, called by both `ci.yml` (so every
+# push/PR gets a status check) and `tag-on-merge.yml` (so a broken commit
+# on main can never be auto-tagged and released -- see that workflow's own
+# comment). Kept as its own file rather than duplicated in both callers.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Both platforms release.yml already ships binaries for. lh-execution's
+    # sandbox backend is platform-gated (Landlock on Linux, Seatbelt on
+    # macOS, cfg(target_os) in crates/lh-execution/src/sandbox.rs) -- a
+    # Linux-only test run would never compile or exercise the macOS half at
+    # all, even though release.yml has been building it unverified this
+    # whole time.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (including tests)
+        run: cargo build --workspace --all-targets
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  clippy:
+    # Informational only (no -D warnings): the workspace currently carries
+    # a handful of pre-existing clippy warnings (type_complexity,
+    # too_many_arguments, cmp_owned) that haven't been cleaned up yet.
+    # Surfacing them here without failing the build avoids blocking every
+    # future push on an unrelated backlog; tighten to `-D warnings` once
+    # that backlog is cleared.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (report only)
+        run: cargo clippy --workspace --all-targets

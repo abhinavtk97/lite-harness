@@ -1,0 +1,12 @@
+name: ci
+
+# Status check on every push (any branch) and every PR -- calls the
+# reusable test workflow (test.yml) so feature-branch pushes get the same
+# build+test signal that tag-on-merge.yml enforces before releasing.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
