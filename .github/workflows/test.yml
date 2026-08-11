@@ -55,3 +55,26 @@ jobs:
 
       - name: Clippy (report only)
         run: cargo clippy --workspace --all-targets
+
+  coverage:
+    # Blocking, unlike clippy above: line coverage was brought from 71.61%
+    # to 96%+ workspace-wide, and this is what keeps it there -- a change
+    # that drops coverage below the floor fails the build rather than
+    # silently eroding it commit by commit. Ubuntu-only (coverage doesn't
+    # need the cross-platform matrix `test` above has; this crate's
+    # sandbox backend is platform-gated but exercised on whichever OS this
+    # job runs on either way).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Enforce line coverage floor
+        run: cargo llvm-cov --workspace --fail-under-lines 95
