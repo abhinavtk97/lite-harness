@@ -4,7 +4,7 @@
 //! why the split exists.
 
 use anyhow::Result;
-use crossterm::event::{Event as CtEvent, EventStream, KeyEventKind};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use futures::StreamExt;
@@ -13,18 +13,20 @@ use lh_tui::app::App;
 use lh_tui::client::DaemonClient;
 use lh_tui::{dispatch, ui};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
-/// RAII guard: undoes raw mode / alternate screen on drop, including the
-/// panic path -- without this, a panic mid-render leaves the user's real
-/// terminal in raw mode with no visible cursor or scrollback, unusable
-/// until they blindly type `reset`.
+/// RAII guard: undoes raw mode / alternate screen / mouse capture on drop,
+/// including the panic path -- without this, a panic mid-render leaves the
+/// user's real terminal in raw mode with no visible cursor or scrollback
+/// (and, now, spewing raw mouse escape sequences into whatever shell they
+/// drop back into), unusable until they blindly type `reset`.
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
@@ -32,7 +34,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -77,6 +79,11 @@ async fn main() -> Result<()> {
                 match maybe_ct_event {
                     Some(Ok(CtEvent::Key(key))) if key.kind == KeyEventKind::Press => {
                         dispatch::handle_key(&mut app, &mut client, key).await?;
+                    }
+                    Some(Ok(CtEvent::Mouse(mouse_event))) => {
+                        let size = terminal.size()?;
+                        let area = Rect::new(0, 0, size.width, size.height);
+                        dispatch::handle_mouse_event(&mut app, &mut client, mouse_event, area).await?;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => {

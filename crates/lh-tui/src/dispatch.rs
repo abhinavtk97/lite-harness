@@ -4,15 +4,17 @@
 //! through these same functions with synthetic key events and no real tty.
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use lh_protocol::{
     methods, AgentsListParams, AgentsListResult, InitializeParams, LedgerQueryParams, PermissionAskResult,
     SessionCreateParams, SessionCreateResult, SessionDelegateParams, SessionDelegateResult, SessionPromptParams,
     SessionPromptResult, PROTOCOL_VERSION,
 };
+use ratatui::layout::Rect;
 
 use crate::app::{describe_permission_action, App, ConnPhase, PendingKind, PendingPermission, PermissionChoice};
 use crate::client::{ClientEvent, DaemonClient};
+use crate::mouse;
 
 /// Sends `initialize` and marks it pending -- the rest of the handshake
 /// (`session/create`, then unlocking input) continues through
@@ -228,6 +230,23 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
         KeyCode::End => app.input.move_line_end(),
         KeyCode::Char(c) => app.input.insert_char(c),
         _ => {}
+    }
+    Ok(())
+}
+
+/// The mouse counterpart to `handle_key` -- `mouse::handle_mouse` does the
+/// actual (pure, I/O-free) hit-testing and `App` mutation; this just acts
+/// on its result the same way the keyboard path's `y`/`Enter` handling
+/// does, via the same `respond_to_permission` helper, so a clicked and a
+/// typed decision are answered identically from here on.
+pub async fn handle_mouse_event(
+    app: &mut App,
+    client: &mut DaemonClient,
+    event: MouseEvent,
+    terminal_area: Rect,
+) -> Result<()> {
+    if let Some(choice) = mouse::handle_mouse(app, event, terminal_area) {
+        respond_to_permission(app, client, choice.decision()).await?;
     }
     Ok(())
 }
@@ -472,6 +491,44 @@ mod tests {
         app.pending_permission =
             Some(PendingPermission { request_id: -1, request: crate::app::fake_permission_request(), selected: 0 });
         app
+    }
+
+    const TEST_TERMINAL: Rect = Rect { x: 0, y: 0, width: 120, height: 40 };
+
+    #[tokio::test]
+    async fn a_mouse_click_on_a_permission_option_answers_it_the_same_way_the_keyboard_does() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let mut app = pending_permission_app();
+        let mut client = inert_client().await;
+
+        let popup = crate::ui::permission_popup_rect(TEST_TERMINAL);
+        let (_, options_row, _) = crate::ui::permission_modal_rows(popup);
+        let deny_rect = crate::ui::permission_option_rects(options_row)
+            [PermissionChoice::ALL.iter().position(|c| *c == PermissionChoice::Deny).unwrap()];
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: deny_rect.x,
+            row: deny_rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse_event(&mut app, &mut client, click, TEST_TERMINAL).await.unwrap();
+
+        assert!(app.pending_permission.is_none(), "the click should have answered the request");
+    }
+
+    #[tokio::test]
+    async fn a_mouse_scroll_with_nothing_pending_scrolls_the_transcript() {
+        use crossterm::event::MouseEventKind;
+
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        let scroll = MouseEvent { kind: MouseEventKind::ScrollUp, column: 5, row: 5, modifiers: KeyModifiers::NONE };
+
+        handle_mouse_event(&mut app, &mut client, scroll, TEST_TERMINAL).await.unwrap();
+
+        assert!(app.transcript_scroll > 0);
     }
 
     #[tokio::test]

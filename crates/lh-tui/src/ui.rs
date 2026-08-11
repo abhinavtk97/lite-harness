@@ -4,7 +4,7 @@
 //! real terminal and no daemon connection (see `tests` below).
 
 use lh_event::{ChildKind, ChildOutcome, PermissionAction, PlanStepStatus};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -60,12 +60,56 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
+/// The modal's outer popup `Rect` -- shared with `mouse.rs` so a click's
+/// hit-test uses the exact same bounds `draw` rendered into, rather than a
+/// second, possibly-drifting computation of "where the modal is".
+pub(crate) fn permission_popup_rect(area: Rect) -> Rect {
+    centered_rect(70, 60, area)
+}
+
+/// Splits the modal's inner (post-border) area into (content, options row,
+/// hint row) -- the options row and hint row are always exactly 1 row
+/// each, pinned to the *bottom* via `Constraint::Min` on the content area
+/// above them, so a long action description or a big diff can never push
+/// the options off-screen (they'd just get clipped themselves, which is
+/// the point: the options stay visible either way). Fixed-height rows
+/// also mean their bounds are deterministic regardless of how much text
+/// content contains -- exactly what `mouse.rs` needs for a reliable click
+/// hit-test without duplicating `content`'s word-wrap math.
+pub(crate) fn permission_modal_rows(popup: Rect) -> (Rect, Rect, Rect) {
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+    (rows[0], rows[1], rows[2])
+}
+
+/// The options row split into `PermissionChoice::ALL.len()` equal columns,
+/// in the same order the choices are drawn in -- index `i` here is choice
+/// `PermissionChoice::ALL[i]`.
+pub(crate) fn permission_option_rects(options_row: Rect) -> Vec<Rect> {
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(vec![Constraint::Ratio(1, PermissionChoice::ALL.len() as u32); PermissionChoice::ALL.len()])
+        .split(options_row)
+        .to_vec()
+}
+
 fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermission) {
-    let popup = centered_rect(70, 60, area);
+    let popup = permission_popup_rect(area);
     // Without this, the modal would be alpha-blended onto whatever the
     // transcript/sidebar already drew there -- `Clear` erases the cells
     // first so the popup reads as solid, not a ghostly overlay.
     frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" permission requested ");
+    frame.render_widget(block, popup);
+
+    let (content_area, options_row, hint_row) = permission_modal_rows(popup);
 
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -75,39 +119,31 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
         Line::from(""),
         Line::from(describe_permission_action(&pending.request.action)),
     ];
-
     if let PermissionAction::FileWrite { diff_summary: Some(diff), .. } = &pending.request.action {
         lines.push(Line::from(""));
         for diff_line in diff.lines() {
             lines.push(Line::from(Span::styled(diff_line.to_string(), Style::default().fg(Color::DarkGray))));
         }
     }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content_area);
 
-    lines.push(Line::from(""));
-    let mut option_spans = Vec::new();
+    let option_rects = permission_option_rects(options_row);
     for (i, choice) in PermissionChoice::ALL.iter().enumerate() {
-        if i > 0 {
-            option_spans.push(Span::raw("  "));
-        }
         let style = if i == pending.selected {
             Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
-        option_spans.push(Span::styled(format!(" {} ", choice.label()), style));
+        let label = Paragraph::new(Line::from(Span::styled(choice.label(), style))).alignment(Alignment::Center);
+        frame.render_widget(label, option_rects[i]);
     }
-    lines.push(Line::from(option_spans));
-    lines.push(Line::from(Span::styled(
-        "left/right to choose, enter to confirm (y/n/a/d shortcuts)",
-        Style::default().fg(Color::DarkGray),
-    )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(" permission requested ");
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, popup);
+    let hint = Paragraph::new(Line::from(Span::styled(
+        "click or left/right to choose, enter to confirm (y/n/a/d shortcuts)",
+        Style::default().fg(Color::DarkGray),
+    )))
+    .alignment(Alignment::Center);
+    frame.render_widget(hint, hint_row);
 }
 
 /// The sidebar is additive: with nothing to show yet (no plan, no child
