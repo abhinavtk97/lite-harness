@@ -13,7 +13,8 @@ use std::sync::Arc;
 use agent_client_protocol_schema::v1 as acp;
 use lh_event::{
     Actor, AgentKind, ContentBlock, Event, EventPayload, PermissionAction, PermissionDecision,
-    PermissionRequest, RiskTier, SessionId, ToolCall, ToolCallStatus, ToolSource,
+    PermissionRequest, PlanStep, PlanStepStatus, RiskTier, SessionId, ToolCall, ToolCallStatus,
+    ToolSource,
 };
 use lh_execution::{BackgroundProcess, ExecutionPlane};
 use lh_permission::PermissionEngine;
@@ -368,8 +369,34 @@ pub fn translate_acp_update(update: &acp::SessionUpdate) -> Option<EventPayload>
                 .and_then(|blocks| blocks.first())
                 .and_then(translate_acp_tool_call_content),
         }),
+        acp::SessionUpdate::Plan(plan) => Some(EventPayload::PlanUpdated {
+            steps: translate_acp_plan(plan),
+        }),
         _ => None,
     }
+}
+
+/// Maps ACP's `Plan.entries` (§Agent Plan) onto our own `PlanStep`s -- the
+/// native loop's `plan_update` tool produces the identical `PlanUpdated`
+/// shape, so a client renders a delegated agent's plan and a native
+/// subagent's plan the same way. `priority` has no equivalent in our
+/// schema and is dropped, same as any other ACP field we don't model
+/// (e.g. `UsageUpdate.size`). `PlanEntryStatus` is `#[non_exhaustive]` in
+/// the schema crate, so an unrecognized future variant maps to `Pending`
+/// (never falsely claims completion) rather than failing to compile.
+fn translate_acp_plan(plan: &acp::Plan) -> Vec<PlanStep> {
+    plan.entries
+        .iter()
+        .map(|entry| PlanStep {
+            description: entry.content.clone(),
+            status: match entry.status {
+                acp::PlanEntryStatus::Pending => PlanStepStatus::Pending,
+                acp::PlanEntryStatus::InProgress => PlanStepStatus::InProgress,
+                acp::PlanEntryStatus::Completed => PlanStepStatus::Completed,
+                _ => PlanStepStatus::Pending,
+            },
+        })
+        .collect()
 }
 
 fn translate_acp_content_block(block: &acp::ContentBlock) -> ContentBlock {
@@ -565,5 +592,28 @@ mod tests {
         assert_eq!(infer_risk_tier(acp::ToolKind::Execute), RiskTier::Execute);
         assert_eq!(infer_risk_tier(acp::ToolKind::Delete), RiskTier::Destructive);
         assert_eq!(infer_risk_tier(acp::ToolKind::Read), RiskTier::Read);
+    }
+
+    /// Previously the fallthrough `_ => None` silently dropped an incoming
+    /// `session/update` -> `Plan` notification -- an agent's plan would just
+    /// never appear anywhere. This pins the fix: `translate_acp_update` must
+    /// produce a `PlanUpdated` event with every entry mapped, in order.
+    #[test]
+    fn translate_acp_update_maps_plan_to_plan_updated() {
+        let plan = acp::Plan::new(vec![
+            acp::PlanEntry::new("find the bug", acp::PlanEntryPriority::High, acp::PlanEntryStatus::InProgress),
+            acp::PlanEntry::new("fix it", acp::PlanEntryPriority::Medium, acp::PlanEntryStatus::Pending),
+            acp::PlanEntry::new("done", acp::PlanEntryPriority::Low, acp::PlanEntryStatus::Completed),
+        ]);
+
+        let payload = translate_acp_update(&acp::SessionUpdate::Plan(plan)).unwrap();
+        let EventPayload::PlanUpdated { steps } = payload else {
+            panic!("expected PlanUpdated, got {payload:?}");
+        };
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].description, "find the bug");
+        assert_eq!(steps[0].status, PlanStepStatus::InProgress);
+        assert_eq!(steps[1].status, PlanStepStatus::Pending);
+        assert_eq!(steps[2].status, PlanStepStatus::Completed);
     }
 }

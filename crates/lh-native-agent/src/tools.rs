@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use lh_event::{PermissionAction, RiskTier};
+use lh_event::{PermissionAction, PlanStep, PlanStepStatus, RiskTier};
 use lh_model_provider::ToolSpec;
 
 pub fn builtin_tool_specs() -> Vec<ToolSpec> {
@@ -80,6 +80,46 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "bash_wait".to_string(),
+            description: "Block until a command started with bash_background finishes, then \
+                return its final output and exit status, given its bash_id. Use this instead of \
+                polling bash_output in a loop when you actually need to wait for completion \
+                before continuing."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "bash_id": { "type": "string" } },
+                "required": ["bash_id"]
+            }),
+        },
+        ToolSpec {
+            name: "plan_update".to_string(),
+            description: "Report or replace your current step-by-step plan for this task, so \
+                the user can see progress. Each call replaces the entire plan with the full, \
+                current list of steps -- call it again whenever a step's status changes."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"]
+                                }
+                            },
+                            "required": ["description", "status"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+        },
+        ToolSpec {
             name: "spawn_subagent".to_string(),
             description: "Delegate a focused sub-task to a fresh native subagent with its own \
                 conversation (it does not see this conversation's history, only the instructions \
@@ -104,14 +144,18 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// `bash_output`/`bash_kill` deliberately have no arms here -- unlike
-/// every other tool, `NativeAgentLoop::handle_one_tool_call` intercepts
-/// them *before* this function is ever called, skipping a fresh live
-/// permission ask entirely (mirrors the identical design decision already
-/// made for ACP's `terminal/output`/`terminal/wait_for_exit`/`terminal/kill`
-/// in `lh-acp`: reading or killing an already-approved background process
-/// -- started by a permission-gated `bash_background` call -- creates no
-/// new risk to ask about again).
+/// `bash_output`/`bash_wait`/`bash_kill`/`plan_update` deliberately have no
+/// arms here -- unlike every other tool, `NativeAgentLoop::handle_one_tool_call`
+/// intercepts them *before* this function is ever called, skipping a fresh
+/// live permission ask entirely. For the three `bash_*` ones this mirrors
+/// the identical design decision already made for ACP's `terminal/output`/
+/// `terminal/wait_for_exit`/`terminal/kill` in `lh-acp`: reading, blocking
+/// on, or killing an already-approved background process -- started by a
+/// permission-gated `bash_background` call -- creates no new risk to ask
+/// about again. `plan_update` is simpler still: it never touches the
+/// system at all (no file, no process, no network), just appends a
+/// `PlanUpdated` bookkeeping event, so it was never risk-bearing in the
+/// first place.
 pub fn permission_action_for(tool_name: &str, input: &serde_json::Value) -> PermissionAction {
     match tool_name {
         "read_file" => PermissionAction::FileRead {
@@ -150,6 +194,27 @@ pub fn risk_tier_for(tool_name: &str) -> RiskTier {
 
 fn str_arg<'a>(input: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     input.get(key)?.as_str()
+}
+
+/// Parses `plan_update`'s `steps` argument into `PlanStep`s. `None` means
+/// the input was malformed (missing/wrong-shaped `steps`, or an
+/// unrecognized `status` string) -- the caller turns that into a `Failed`
+/// tool result rather than silently emitting a partial or empty plan.
+pub fn parse_plan_steps(input: &serde_json::Value) -> Option<Vec<PlanStep>> {
+    let steps = input.get("steps")?.as_array()?;
+    steps
+        .iter()
+        .map(|s| {
+            let description = s.get("description")?.as_str()?.to_string();
+            let status = match s.get("status")?.as_str()? {
+                "pending" => PlanStepStatus::Pending,
+                "in_progress" => PlanStepStatus::InProgress,
+                "completed" => PlanStepStatus::Completed,
+                _ => return None,
+            };
+            Some(PlanStep { description, status })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -191,5 +256,29 @@ mod tests {
             PermissionAction::SpawnSubagent { role, task_summary }
                 if role == "researcher" && task_summary == "find the bug"
         ));
+    }
+
+    #[test]
+    fn parse_plan_steps_reads_every_status_variant() {
+        let steps = parse_plan_steps(&serde_json::json!({"steps": [
+            {"description": "a", "status": "pending"},
+            {"description": "b", "status": "in_progress"},
+            {"description": "c", "status": "completed"},
+        ]}))
+        .unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].status, PlanStepStatus::Pending);
+        assert_eq!(steps[1].status, PlanStepStatus::InProgress);
+        assert_eq!(steps[2].status, PlanStepStatus::Completed);
+    }
+
+    #[test]
+    fn parse_plan_steps_rejects_an_unrecognized_status() {
+        assert!(parse_plan_steps(&serde_json::json!({"steps": [{"description": "a", "status": "done"}]})).is_none());
+    }
+
+    #[test]
+    fn parse_plan_steps_rejects_a_missing_steps_field() {
+        assert!(parse_plan_steps(&serde_json::json!({})).is_none());
     }
 }

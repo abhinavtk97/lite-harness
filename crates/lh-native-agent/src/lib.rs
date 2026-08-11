@@ -35,6 +35,7 @@ use lh_event::{
     PermissionDecision, PermissionRequest, SessionDriver, SessionId, ToolCall, ToolCallStatus,
     ToolSource, UsageConfidence, UsageDelta,
 };
+use tools::parse_plan_steps;
 use lh_execution::{BackgroundProcess, ExecutionPlane};
 use lh_model_provider::{ChatContent, ChatMessage, ChatRole, ModelProvider, ModelRequest, ToolSpec};
 use lh_orchestration::{ChildRunner, TaskHandoff};
@@ -344,15 +345,47 @@ impl NativeAgentLoop {
         )
         .await?;
 
-        // bash_output/bash_kill act on a background process that a prior,
-        // permission-gated bash_background call already started -- no new
-        // risk to ask about, so (mirroring the identical design decision
+        // bash_output/bash_wait/bash_kill act on a background process that a
+        // prior, permission-gated bash_background call already started -- no
+        // new risk to ask about, so (mirroring the identical design decision
         // for ACP's terminal/output|wait_for_exit|kill in lh-acp) they skip
         // the live ask entirely, going straight to their own ToolCallUpdated
         // for audit visibility instead of the usual PermissionRequested/
         // PermissionDecided pair.
-        if tool_name == "bash_output" || tool_name == "bash_kill" {
+        if tool_name == "bash_output" || tool_name == "bash_wait" || tool_name == "bash_kill" {
             let (status, output, is_error) = self.query_background_process(tool_name, input).await;
+            self.emit(
+                session_id,
+                Actor::System,
+                EventPayload::ToolCallUpdated {
+                    call_id: call_id.to_string(),
+                    status,
+                    output: Some(ContentBlock::text(output.clone())),
+                },
+            )
+            .await?;
+            return Ok((output, is_error));
+        }
+
+        // plan_update never touches the system (no file, process, or
+        // network) -- it's pure bookkeeping, so it also skips the live ask,
+        // going straight to a PlanUpdated event plus the usual
+        // ToolCallUpdated for audit visibility.
+        if tool_name == "plan_update" {
+            let (status, output, is_error) = match parse_plan_steps(input) {
+                Some(steps) => {
+                    let step_count = steps.len();
+                    self.emit(session_id, Actor::Agent, EventPayload::PlanUpdated { steps }).await?;
+                    (ToolCallStatus::Completed, format!("plan updated ({step_count} step(s))"), false)
+                }
+                None => (
+                    ToolCallStatus::Failed,
+                    "plan_update requires 'steps': [{description, status}] with status one of \
+                     pending/in_progress/completed"
+                        .to_string(),
+                    true,
+                ),
+            };
             self.emit(
                 session_id,
                 Actor::System,
@@ -444,8 +477,9 @@ impl NativeAgentLoop {
         Ok((output, is_error))
     }
 
-    /// `bash_output`/`bash_kill`'s actual logic -- looked up by the id
-    /// `bash_background` minted and stored in `self.background_processes`.
+    /// `bash_output`/`bash_wait`/`bash_kill`'s actual logic -- looked up by
+    /// the id `bash_background` minted and stored in
+    /// `self.background_processes`.
     async fn query_background_process(
         &self,
         tool_name: &str,
@@ -469,11 +503,19 @@ impl NativeAgentLoop {
                 }
                 (ToolCallStatus::Completed, text, false)
             }
+            "bash_wait" => {
+                let status = process.wait_for_exit().await;
+                (
+                    ToolCallStatus::Completed,
+                    format!("[exited: code={:?} signal={:?}]", status.code, status.signal),
+                    false,
+                )
+            }
             "bash_kill" => {
                 process.kill().await;
                 (ToolCallStatus::Completed, format!("killed {bash_id}"), false)
             }
-            _ => unreachable!("query_background_process is only called for bash_output/bash_kill"),
+            _ => unreachable!("query_background_process is only called for bash_output/bash_wait/bash_kill"),
         }
     }
 
@@ -1229,6 +1271,188 @@ mod tests {
         let permission_asks =
             events.iter().filter(|e| matches!(e.payload, EventPayload::PermissionRequested { .. })).count();
         assert_eq!(permission_asks, 2);
+    }
+
+    #[tokio::test]
+    async fn bash_wait_blocks_until_the_process_exits_with_no_fresh_permission_ask() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let provider = Arc::new(ScriptedModelProvider::new(vec![]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let session_id = SessionId::now_v7();
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            registry.clone(),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (bash_id, _) = agent
+            .handle_one_tool_call(
+                session_id,
+                "call_1",
+                "bash_background",
+                &serde_json::json!({"command": "sleep 0.2; echo finished"}),
+            )
+            .await
+            .unwrap();
+
+        let (output, is_error) = agent
+            .handle_one_tool_call(session_id, "call_2", "bash_wait", &serde_json::json!({"bash_id": bash_id}))
+            .await
+            .unwrap();
+        assert!(!is_error);
+        assert!(output.contains("exited"), "bash_wait must report the exit status, got: {output}");
+
+        // The process really did run to completion by the time bash_wait
+        // returned, not just "not yet checked" -- bash_output afterwards
+        // must see the finished output rather than "still running".
+        let (after, is_error) = agent
+            .handle_one_tool_call(session_id, "call_3", "bash_output", &serde_json::json!({"bash_id": bash_id}))
+            .await
+            .unwrap();
+        assert!(!is_error);
+        assert!(after.contains("finished"), "got: {after}");
+
+        // bash_wait must not have gone through a fresh permission ask --
+        // only the one bash_background call should have.
+        let events = store.read_from(session_id, 0).await.unwrap();
+        let permission_asks =
+            events.iter().filter(|e| matches!(e.payload, EventPayload::PermissionRequested { .. })).count();
+        assert_eq!(permission_asks, 1);
+    }
+
+    #[tokio::test]
+    async fn bash_wait_on_an_unknown_id_is_a_clean_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+        let agent = NativeAgentLoop::new(
+            store,
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            registry,
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(SessionId::now_v7(), "call_1", "bash_wait", &serde_json::json!({"bash_id": "nope"}))
+            .await
+            .unwrap();
+        assert!(is_error);
+        assert!(out.contains("unknown bash_id"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn plan_update_emits_a_plan_updated_event_with_no_permission_ask() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+        let session_id = SessionId::now_v7();
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            registry,
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(
+                session_id,
+                "call_1",
+                "plan_update",
+                &serde_json::json!({"steps": [
+                    {"description": "find the bug", "status": "in_progress"},
+                    {"description": "fix it", "status": "pending"},
+                ]}),
+            )
+            .await
+            .unwrap();
+        assert!(!is_error, "got: {out}");
+        assert!(out.contains("2 step"), "got: {out}");
+
+        let events = store.read_from(session_id, 0).await.unwrap();
+        assert_eq!(
+            events.iter().filter(|e| matches!(e.payload, EventPayload::PermissionRequested { .. })).count(),
+            0,
+            "plan_update never touches the system, so it must never ask permission"
+        );
+        let plan = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                EventPayload::PlanUpdated { steps } => Some(steps.clone()),
+                _ => None,
+            })
+            .expect("a PlanUpdated event must have been appended");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].description, "find the bug");
+        assert_eq!(plan[0].status, lh_event::PlanStepStatus::InProgress);
+        assert_eq!(plan[1].status, lh_event::PlanStepStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn plan_update_with_a_bad_status_is_a_clean_error_not_a_partial_plan() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+        let session_id = SessionId::now_v7();
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            registry,
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(
+                session_id,
+                "call_1",
+                "plan_update",
+                &serde_json::json!({"steps": [{"description": "x", "status": "done"}]}),
+            )
+            .await
+            .unwrap();
+        assert!(is_error, "got: {out}");
+
+        let events = store.read_from(session_id, 0).await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e.payload, EventPayload::PlanUpdated { .. })),
+            "a malformed plan_update must not append a partial PlanUpdated event"
+        );
     }
 
     #[tokio::test]
