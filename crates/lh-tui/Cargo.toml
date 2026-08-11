@@ -1,0 +1,22 @@
+[package]
+name = "lh-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lite-harness-tui"
+path = "src/main.rs"
+
+[dependencies]
+lh-event = { path = "../lh-event" }
+lh-protocol = { path = "../lh-protocol" }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true

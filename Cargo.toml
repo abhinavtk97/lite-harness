@@ -14,6 +14,7 @@ members = [
     "crates/lh-daemon",
     "crates/lh-cli",
     "crates/lh-web-backend",
+    "crates/lh-tui",
 ]
 
 [workspace.package]
