@@ -24,11 +24,11 @@ use lh_native_agent::{AgentConfig, NativeAgentLoop};
 use lh_orchestration::{ChildRunner, TaskHandoff};
 use lh_permission::{DefaultPermissionEngine, PermissionEngine, SessionPolicyStore, TomlPolicyStore};
 use lh_protocol::{
-    buffered, default_socket_path, methods, read_message, write_message, InitializeResult,
-    LedgerQueryParams, LedgerQueryResult, Message, Notification, PermissionAskResult,
-    Request as ProtoRequest, RequestId, Response, SessionCreateParams, SessionCreateResult,
-    SessionDelegateParams, SessionDelegateResult, SessionPromptParams, SessionPromptResult,
-    PROTOCOL_VERSION,
+    buffered, default_socket_path, methods, read_message, write_message, AgentInfo,
+    AgentsListResult, InitializeResult, LedgerQueryParams, LedgerQueryResult, Message,
+    Notification, PermissionAskResult, Request as ProtoRequest, RequestId, Response,
+    SessionCreateParams, SessionCreateResult, SessionDelegateParams, SessionDelegateResult,
+    SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
 };
 use lh_store::{SessionStore, SqliteSessionStore};
 use permission::SocketPrompter;
@@ -207,13 +207,31 @@ async fn handle_connection(
     )
     .await?;
 
-    // 2. session/create
-    let Some(Message::Request(req)) = read_message(&mut reader).await? else {
-        return Ok(());
+    // 2. agents/list is queryable any number of times here, before the
+    // client commits to session/create -- a UI needs to know which agents
+    // are registered, and which can_be_primary, before it can build a
+    // "which agent should drive this session?" picker (architecture
+    // §12.5). Loops until session/create actually arrives.
+    let req = loop {
+        let Some(Message::Request(req)) = read_message(&mut reader).await? else {
+            return Ok(());
+        };
+        if req.method == methods::AGENTS_LIST {
+            let agents = agents_registry
+                .agents
+                .iter()
+                .map(|a| AgentInfo { kind: a.kind.clone(), can_be_primary: a.can_be_primary })
+                .collect();
+            respond(&write_half, req.id, AgentsListResult { agents }).await?;
+            continue;
+        }
+        break req;
     };
+
+    // 3. session/create
     ensure!(
         req.method == methods::SESSION_CREATE,
-        "expected session/create, got {}",
+        "expected session/create (or agents/list), got {}",
         req.method
     );
     let params: SessionCreateParams = serde_json::from_value(req.params)?;
@@ -289,7 +307,7 @@ async fn handle_connection(
     ));
     let workspace_root = PathBuf::from(&params.cwd);
 
-    // 3. steady state: session/prompt and permission/respond, interleaved.
+    // 4. steady state: session/prompt and permission/respond, interleaved.
     loop {
         match read_message(&mut reader).await? {
             Some(Message::Request(req)) if req.method == methods::SESSION_PROMPT => {

@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use lh_event::{AgentKind, ContentBlock, Event, EventPayload, PermissionDecision};
 use lh_protocol::{
-    buffered, default_socket_path, methods, read_message, write_message, InitializeParams,
-    InitializeResult, LedgerQueryParams, LedgerQueryResult, Message, PermissionAskParams,
-    PermissionAskResult, PrimarySelector, Request, RequestId, Response, SessionCreateParams,
-    SessionCreateResult, SessionDelegateParams, SessionDelegateResult, SessionPromptParams,
-    SessionPromptResult, PROTOCOL_VERSION,
+    buffered, default_socket_path, methods, read_message, write_message, AgentsListParams,
+    AgentsListResult, InitializeParams, InitializeResult, LedgerQueryParams, LedgerQueryResult,
+    Message, PermissionAskParams, PermissionAskResult, PrimarySelector, Request, RequestId,
+    Response, SessionCreateParams, SessionCreateResult, SessionDelegateParams,
+    SessionDelegateResult, SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
 use tokio::net::UnixStream;
@@ -42,39 +42,51 @@ fn parse_agent_name(usage: &str, name: &str) -> Result<AgentKind> {
     }
 }
 
+/// `--list-agents` (architecture §12.5) is its own command, not a `CliMode`
+/// -- it never creates a session, just queries the registry and exits, so
+/// a UI (or a human at the CLI) can see which agents are available and
+/// which `can_be_primary` before picking one.
+enum Command {
+    ListAgents,
+    Run(CliMode, String),
+}
+
 /// `lite-harness [--agent claude-code | --primary claude-code] <prompt>` --
 /// omitting both flags keeps today's default (native loop driving the
-/// root, plain `session/prompt`).
-fn parse_args() -> Result<(CliMode, String)> {
+/// root, plain `session/prompt`). `lite-harness --list-agents` is the one
+/// exception that takes no prompt.
+fn parse_args() -> Result<Command> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: lite-harness [--agent claude-code | --primary claude-code] <prompt>\n  \
+        lite-harness --list-agents\n  \
         e.g. lite-harness \"list the files in this directory\"\n  \
         e.g. lite-harness --agent claude-code \"fix the failing test\"\n  \
         e.g. lite-harness --primary claude-code \"refactor this module\"";
 
     match args.first().map(String::as_str) {
+        Some("--list-agents") => Ok(Command::ListAgents),
         Some("--agent") => {
             let name = args.get(1).ok_or_else(|| anyhow!("{usage}\n\n--agent requires a value"))?;
             let agent = parse_agent_name(usage, name)?;
             let prompt = args.get(2).ok_or_else(|| anyhow!("{usage}"))?.clone();
-            Ok((CliMode::DelegateChild(agent), prompt))
+            Ok(Command::Run(CliMode::DelegateChild(agent), prompt))
         }
         Some("--primary") => {
             let name = args.get(1).ok_or_else(|| anyhow!("{usage}\n\n--primary requires a value"))?;
             let agent = parse_agent_name(usage, name)?;
             let prompt = args.get(2).ok_or_else(|| anyhow!("{usage}"))?.clone();
-            Ok((CliMode::PrimaryDelegated(agent), prompt))
+            Ok(Command::Run(CliMode::PrimaryDelegated(agent), prompt))
         }
         _ => {
             let prompt = args.first().ok_or_else(|| anyhow!("{usage}"))?.clone();
-            Ok((CliMode::Native, prompt))
+            Ok(Command::Run(CliMode::Native, prompt))
         }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (mode, prompt) = parse_args()?;
+    let command = parse_args()?;
 
     let cwd = std::env::current_dir()?;
     let sock_path = default_socket_path(&cwd);
@@ -95,6 +107,32 @@ async fn main() -> Result<()> {
     )
     .await?;
     eprintln!("connected to daemon (protocol v{})", init_result.protocol_version);
+
+    let (mode, prompt) = match command {
+        Command::ListAgents => {
+            let result: AgentsListResult = request(
+                &mut write_half,
+                &mut reader,
+                &mut next_id,
+                methods::AGENTS_LIST,
+                serde_json::to_value(AgentsListParams::default())?,
+            )
+            .await?;
+            if result.agents.is_empty() {
+                println!("no delegated agents configured (see LITE_HARNESS_AGENTS_FILE)");
+            } else {
+                for agent in &result.agents {
+                    println!(
+                        "{:?}{}",
+                        agent.kind,
+                        if agent.can_be_primary { " (can be primary)" } else { "" }
+                    );
+                }
+            }
+            return Ok(());
+        }
+        Command::Run(mode, prompt) => (mode, prompt),
+    };
 
     let primary = match &mode {
         CliMode::PrimaryDelegated(agent) => PrimarySelector::Delegated { agent: agent.clone() },

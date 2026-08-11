@@ -132,6 +132,14 @@ pub mod methods {
     /// child) is `PrimarySelector` at `session/create`, Phase 6/§12 -- not
     /// this method.
     pub const SESSION_DELEGATE: &str = "session/delegate";
+    /// Queryable any number of times *before* `session/create` (architecture
+    /// §12.5) -- a UI needs to know which delegated agents are registered,
+    /// and which of those `can_be_primary`, before it can build a "which
+    /// agent should drive this session?" picker that only offers valid
+    /// `PrimarySelector` choices. Not restricted to before `session/create`
+    /// structurally, just conventionally placed there since that's the only
+    /// point a client actually needs it.
+    pub const AGENTS_LIST: &str = "agents/list";
     /// Streamed daemon -> client notification carrying an `lh_event::Event`.
     pub const EVENT: &str = "event";
 }
@@ -220,6 +228,27 @@ pub struct SessionDelegateParams {
 pub struct SessionDelegateResult {
     pub child_session_id: lh_event::SessionId,
     pub outcome: lh_event::ChildOutcome,
+}
+
+/// No fields today -- a struct (not `()`) so a filter (e.g. "only agents
+/// that can be primary") has somewhere to go later without a breaking
+/// wire-shape change.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentsListParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub kind: lh_event::AgentKind,
+    /// §12.5 -- whether `PrimarySelector::Delegated { agent: kind }` at
+    /// `session/create` would be accepted for this adapter, mirroring
+    /// `DelegatedAgentAdapter.can_be_primary` exactly (that field is the
+    /// registry's own; this is its public, protocol-level reflection).
+    pub can_be_primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsListResult {
+    pub agents: Vec<AgentInfo>,
 }
 
 // --- Newline-delimited JSON framing ---
