@@ -8,7 +8,7 @@ use lh_event::{
     ChildKind, ChildOutcome, ContentBlock, Event, EventPayload, PermissionAction, PermissionDecision, PermissionRequest,
     PlanStep, PolicyScope, SessionId, ToolCallStatus,
 };
-use lh_protocol::RequestId;
+use lh_protocol::{AgentInfo, PrimarySelector, RequestId};
 
 use crate::input::InputBox;
 
@@ -38,8 +38,16 @@ pub enum ConnPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
     Initialize,
+    /// The daemon only answers `agents/list` in the window between
+    /// `initialize` and `session/create` (its handshake loop stops
+    /// checking for it the moment `session/create` arrives) -- so this
+    /// step is mandatory in the handshake sequence, not optional, even
+    /// though nothing in `App` strictly needs the result until `/agents`
+    /// or `/delegate` is actually typed.
+    AgentsList,
     SessionCreate,
     Prompt,
+    Delegate,
 }
 
 /// The full request is carried (not just its id) so the permission modal
@@ -125,6 +133,17 @@ pub struct App {
     /// way `pending` does (see `dispatch::handle_client_event`).
     pub pending_ledger_query: Option<RequestId>,
     pub last_ledger: Option<lh_ledger::LedgerRollup>,
+    /// Which driver owns *this* session's root -- fixed at `session/create`
+    /// time (set from `--primary` at startup, see `main.rs`) and never
+    /// changed afterward: the daemon's per-connection handshake only
+    /// accepts one `session/create`, so switching it mid-REPL would mean
+    /// opening a whole new connection, not a slash command. `/primary`
+    /// deliberately isn't a command for that reason -- see the phase 8.5
+    /// commit message.
+    pub primary: PrimarySelector,
+    /// Populated once, from the `agents/list` round trip that's part of
+    /// the handshake (see `PendingKind::AgentsList`) -- backs `/agents`.
+    pub available_agents: Vec<AgentInfo>,
 }
 
 impl App {
@@ -143,6 +162,8 @@ impl App {
             child_sessions: Vec::new(),
             pending_ledger_query: None,
             last_ledger: None,
+            primary: PrimarySelector::Native,
+            available_agents: Vec::new(),
         }
     }
 

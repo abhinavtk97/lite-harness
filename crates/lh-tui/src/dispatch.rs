@@ -6,8 +6,9 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use lh_protocol::{
-    methods, InitializeParams, LedgerQueryParams, PermissionAskResult, PrimarySelector, SessionCreateParams,
-    SessionCreateResult, SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
+    methods, AgentsListParams, AgentsListResult, InitializeParams, LedgerQueryParams, PermissionAskResult,
+    SessionCreateParams, SessionCreateResult, SessionDelegateParams, SessionDelegateResult, SessionPromptParams,
+    SessionPromptResult, PROTOCOL_VERSION,
 };
 
 use crate::app::{describe_permission_action, App, ConnPhase, PendingKind, PendingPermission, PermissionChoice};
@@ -64,7 +65,7 @@ pub async fn handle_client_event(
 
             if let Some(err) = resp.error {
                 app.push_error(format!("{} failed: {}", kind_label(kind), err.message));
-                if kind == PendingKind::Initialize || kind == PendingKind::SessionCreate {
+                if matches!(kind, PendingKind::Initialize | PendingKind::AgentsList | PendingKind::SessionCreate) {
                     app.should_quit = true;
                 }
                 return Ok(());
@@ -74,12 +75,23 @@ pub async fn handle_client_event(
             match kind {
                 PendingKind::Initialize => {
                     app.status = "connected".to_string();
+                    // Must happen here, before session/create -- the
+                    // daemon's handshake loop stops answering agents/list
+                    // the moment session/create arrives (see PendingKind::
+                    // AgentsList's doc comment).
+                    let agents_id =
+                        client.send_request(methods::AGENTS_LIST, serde_json::to_value(AgentsListParams::default())?).await?;
+                    app.pending = Some((agents_id, PendingKind::AgentsList));
+                }
+                PendingKind::AgentsList => {
+                    let result: AgentsListResult = serde_json::from_value(result)?;
+                    app.available_agents = result.agents;
                     let create_id = client
                         .send_request(
                             methods::SESSION_CREATE,
                             serde_json::to_value(SessionCreateParams {
                                 cwd: cwd.to_string_lossy().to_string(),
-                                primary: PrimarySelector::Native,
+                                primary: app.primary.clone(),
                             })?,
                         )
                         .await?;
@@ -103,6 +115,10 @@ pub async fn handle_client_event(
                             .await?;
                         app.pending_ledger_query = Some(query_id);
                     }
+                }
+                PendingKind::Delegate => {
+                    let result: SessionDelegateResult = serde_json::from_value(result)?;
+                    app.push_system(format!("delegation finished ({}): {}", result.child_session_id, describe_child_outcome(&result.outcome)));
                 }
             }
         }
@@ -191,6 +207,10 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
             }
             let text = app.input.take();
             app.push_user_message(text.clone());
+            if let Some(command) = text.trim().strip_prefix('/') {
+                handle_slash_command(app, client, command).await?;
+                return Ok(());
+            }
             let prompt_id = client
                 .send_request(methods::SESSION_PROMPT, serde_json::to_value(SessionPromptParams { text })?)
                 .await?;
@@ -232,8 +252,109 @@ const SCROLL_PAGE_LINES: u16 = 10;
 fn kind_label(kind: PendingKind) -> &'static str {
     match kind {
         PendingKind::Initialize => "initialize",
+        PendingKind::AgentsList => "agents/list",
         PendingKind::SessionCreate => "session/create",
         PendingKind::Prompt => "session/prompt",
+        PendingKind::Delegate => "session/delegate",
+    }
+}
+
+const HELP_TEXT: &str = "commands: /help  /quit  /agents  /delegate <agent> <task summary...>";
+
+/// A typed `/`-prefixed line from the input box, dispatched instead of a
+/// `session/prompt` -- see the module-level note on why there's no
+/// `/primary` here (switching the *root* driver needs a whole new
+/// connection, not a command, since the daemon only accepts one
+/// `session/create` per connection).
+async fn handle_slash_command(app: &mut App, client: &mut DaemonClient, command: &str) -> Result<()> {
+    let mut words = command.split_whitespace();
+    match words.next().unwrap_or("") {
+        "help" => app.push_system(HELP_TEXT),
+        "quit" | "q" => app.should_quit = true,
+        "agents" => app.push_system(describe_available_agents(&app.available_agents)),
+        "delegate" => {
+            let Some(agent_name) = words.next() else {
+                app.push_error("usage: /delegate <agent> <task summary...>");
+                return Ok(());
+            };
+            let task_summary = words.collect::<Vec<_>>().join(" ");
+            if task_summary.is_empty() {
+                app.push_error("usage: /delegate <agent> <task summary...>");
+                return Ok(());
+            }
+            let agent = parse_agent_kind(agent_name);
+            app.push_system(format!("delegating to {agent:?}..."));
+            let id = client
+                .send_request(methods::SESSION_DELEGATE, serde_json::to_value(SessionDelegateParams { agent, task_summary })?)
+                .await?;
+            app.pending = Some((id, PendingKind::Delegate));
+        }
+        other => app.push_error(format!("unknown command '/{other}' -- try /help")),
+    }
+    Ok(())
+}
+
+/// `lite-harness-tui [--primary <agent>]` -- mirrors `lite-harness`'s own
+/// `--primary` flag (architecture §12, Phase 6). There's no interactive
+/// equivalent (no `/primary` slash command in `handle_slash_command`): the
+/// daemon only accepts one `session/create` per connection, so switching
+/// the *root* driver mid-REPL would mean opening a whole new connection,
+/// not answering a typed command -- see `App::primary`'s doc comment for
+/// the full reason. Lives here (not in `main.rs`) despite being CLI-arg
+/// parsing because it's pure and terminal-free, so it can actually be unit
+/// tested -- `main.rs` is deliberately untestable glue, see `lib.rs`'s
+/// module doc.
+pub fn parse_primary_arg(args: &[String]) -> Result<lh_protocol::PrimarySelector> {
+    match args.first().map(String::as_str) {
+        None => Ok(lh_protocol::PrimarySelector::Native),
+        Some("--primary") => {
+            let name = args.get(1).ok_or_else(|| anyhow::anyhow!("--primary requires a value, e.g. --primary claude-code"))?;
+            Ok(lh_protocol::PrimarySelector::Delegated { agent: parse_agent_kind(name) })
+        }
+        Some(other) => anyhow::bail!("unknown argument '{other}' (usage: lite-harness-tui [--primary <agent>])"),
+    }
+}
+
+/// Free-form: an agent name the daemon doesn't recognize is a normal,
+/// reportable `session/delegate` error (via the agent registry), not
+/// something worth a second, duplicated allowlist on the client side.
+/// `pub` (not `pub(crate)`) so `main.rs`'s `--primary` flag parsing --
+/// a separate binary crate, not just a separate module -- can reuse it
+/// instead of duplicating the same name-to-`AgentKind` mapping.
+pub fn parse_agent_kind(name: &str) -> lh_event::AgentKind {
+    match name {
+        "claude-code" => lh_event::AgentKind::ClaudeCode,
+        "codex" => lh_event::AgentKind::Codex,
+        "gemini-cli" => lh_event::AgentKind::GeminiCli,
+        "goose" => lh_event::AgentKind::Goose,
+        "opencode" => lh_event::AgentKind::OpenCode,
+        other => lh_event::AgentKind::Custom { name: other.to_string() },
+    }
+}
+
+fn describe_available_agents(agents: &[lh_protocol::AgentInfo]) -> String {
+    if agents.is_empty() {
+        return "no delegated agents registered (see LITE_HARNESS_AGENTS_FILE)".to_string();
+    }
+    let listed = agents
+        .iter()
+        .map(|a| {
+            if a.can_be_primary {
+                format!("{:?} (primary-capable)", a.kind)
+            } else {
+                format!("{:?}", a.kind)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("registered agents: {listed}")
+}
+
+fn describe_child_outcome(outcome: &lh_event::ChildOutcome) -> String {
+    match outcome {
+        lh_event::ChildOutcome::Success { summary } => format!("success: {summary}"),
+        lh_event::ChildOutcome::Failed { message } => format!("failed: {message}"),
+        lh_event::ChildOutcome::Cancelled => "cancelled".to_string(),
     }
 }
 
@@ -616,7 +737,211 @@ mod tests {
     #[test]
     fn kind_label_names_every_variant() {
         assert_eq!(kind_label(PendingKind::Initialize), "initialize");
+        assert_eq!(kind_label(PendingKind::AgentsList), "agents/list");
         assert_eq!(kind_label(PendingKind::SessionCreate), "session/create");
         assert_eq!(kind_label(PendingKind::Prompt), "session/prompt");
+        assert_eq!(kind_label(PendingKind::Delegate), "session/delegate");
+    }
+
+    #[tokio::test]
+    async fn initialize_completing_moves_on_to_agents_list_not_session_create_directly() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending = Some((1, PendingKind::Initialize));
+
+        let resp = Response::ok(1, serde_json::json!({ "protocol_version": 1 }));
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert_eq!(app.pending.map(|(_, kind)| kind), Some(PendingKind::AgentsList));
+    }
+
+    #[tokio::test]
+    async fn agents_list_completing_stores_the_result_and_moves_on_to_session_create() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending = Some((1, PendingKind::AgentsList));
+
+        let agents = lh_protocol::AgentsListResult {
+            agents: vec![lh_protocol::AgentInfo { kind: lh_event::AgentKind::ClaudeCode, can_be_primary: true }],
+        };
+        let resp = Response::ok(1, serde_json::to_value(agents).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert_eq!(app.available_agents.len(), 1);
+        assert_eq!(app.pending.map(|(_, kind)| kind), Some(PendingKind::SessionCreate));
+    }
+
+    #[tokio::test]
+    async fn an_error_response_to_agents_list_quits_the_app() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending = Some((1, PendingKind::AgentsList));
+
+        let mut resp = Response::ok(1, serde_json::json!({}));
+        resp.result = None;
+        resp.error = Some(RpcError { code: -1, message: "boom".to_string() });
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert!(app.should_quit, "the handshake can't proceed without it, so this is fatal like initialize/session-create");
+    }
+
+    #[tokio::test]
+    async fn a_delegate_response_reports_success_and_failure_distinctly() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending = Some((1, PendingKind::Delegate));
+
+        let ok_result = lh_protocol::SessionDelegateResult {
+            child_session_id: lh_event::SessionId::now_v7(),
+            outcome: lh_event::ChildOutcome::Success { summary: "did it".to_string() },
+        };
+        let resp = Response::ok(1, serde_json::to_value(ok_result).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::System(t) if t.contains("success: did it"))));
+
+        app.pending = Some((2, PendingKind::Delegate));
+        let fail_result = lh_protocol::SessionDelegateResult {
+            child_session_id: lh_event::SessionId::now_v7(),
+            outcome: lh_event::ChildOutcome::Failed { message: "nope".to_string() },
+        };
+        let resp = Response::ok(2, serde_json::to_value(fail_result).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::System(t) if t.contains("failed: nope"))));
+    }
+
+    async fn submit_line(app: &mut App, client: &mut DaemonClient, text: &str) {
+        for c in text.chars() {
+            handle_key(app, client, key(KeyCode::Char(c))).await.unwrap();
+        }
+        handle_key(app, client, key(KeyCode::Enter)).await.unwrap();
+    }
+
+    fn ready_app() -> App {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app
+    }
+
+    #[tokio::test]
+    async fn slash_help_prints_the_command_list_without_sending_a_prompt() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+
+        submit_line(&mut app, &mut client, "/help").await;
+
+        assert!(app.pending.is_none(), "a slash command must never start a session/prompt round trip");
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::System(t) if t.contains("/agents"))));
+    }
+
+    #[tokio::test]
+    async fn slash_quit_sets_should_quit() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+
+        submit_line(&mut app, &mut client, "/quit").await;
+
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn slash_agents_with_none_registered_says_so() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+
+        submit_line(&mut app, &mut client, "/agents").await;
+
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::System(t) if t.contains("no delegated agents"))));
+    }
+
+    #[tokio::test]
+    async fn slash_agents_lists_registered_agents_and_flags_primary_capable_ones() {
+        let mut app = ready_app();
+        app.available_agents = vec![
+            lh_protocol::AgentInfo { kind: lh_event::AgentKind::ClaudeCode, can_be_primary: true },
+            lh_protocol::AgentInfo { kind: lh_event::AgentKind::Codex, can_be_primary: false },
+        ];
+        let mut client = inert_client().await;
+
+        submit_line(&mut app, &mut client, "/agents").await;
+
+        let line = app
+            .transcript
+            .iter()
+            .find_map(|i| match i {
+                crate::app::TranscriptItem::System(t) if t.contains("registered agents") => Some(t.clone()),
+                _ => None,
+            })
+            .expect("should have printed the agent list");
+        assert!(line.contains("ClaudeCode (primary-capable)"));
+        assert!(line.contains("Codex"));
+        assert!(!line.contains("Codex (primary-capable)"));
+    }
+
+    #[tokio::test]
+    async fn slash_delegate_with_missing_args_is_a_reported_error_not_a_request() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+
+        submit_line(&mut app, &mut client, "/delegate").await;
+        assert!(app.pending.is_none());
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::Error(t) if t.contains("usage: /delegate"))));
+
+        submit_line(&mut app, &mut client, "/delegate claude-code").await;
+        assert!(app.pending.is_none(), "an agent with no task summary must not fire a request either");
+    }
+
+    #[tokio::test]
+    async fn slash_delegate_with_a_task_sends_session_delegate_and_tracks_it() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+
+        submit_line(&mut app, &mut client, "/delegate claude-code fix the bug").await;
+
+        assert_eq!(app.pending.map(|(_, kind)| kind), Some(PendingKind::Delegate));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_slash_command_is_a_reported_error() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+
+        submit_line(&mut app, &mut client, "/nonsense").await;
+
+        assert!(app.pending.is_none());
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::Error(t) if t.contains("unknown command '/nonsense'"))));
+    }
+
+    #[test]
+    fn parse_primary_arg_with_no_args_defaults_to_native() {
+        assert!(matches!(parse_primary_arg(&[]).unwrap(), lh_protocol::PrimarySelector::Native));
+    }
+
+    #[test]
+    fn parse_primary_arg_with_primary_and_a_name_delegates_to_it() {
+        let args = vec!["--primary".to_string(), "claude-code".to_string()];
+        let result = parse_primary_arg(&args).unwrap();
+        assert!(matches!(result, lh_protocol::PrimarySelector::Delegated { agent: lh_event::AgentKind::ClaudeCode }));
+    }
+
+    #[test]
+    fn parse_primary_arg_with_primary_and_no_value_is_an_error() {
+        let args = vec!["--primary".to_string()];
+        assert!(parse_primary_arg(&args).is_err());
+    }
+
+    #[test]
+    fn parse_primary_arg_with_an_unknown_flag_is_an_error() {
+        let args = vec!["--bogus".to_string()];
+        assert!(parse_primary_arg(&args).is_err());
+    }
+
+    #[test]
+    fn parse_agent_kind_recognizes_the_known_names_and_falls_back_to_custom() {
+        assert!(matches!(parse_agent_kind("claude-code"), lh_event::AgentKind::ClaudeCode));
+        assert!(matches!(parse_agent_kind("codex"), lh_event::AgentKind::Codex));
+        assert!(matches!(parse_agent_kind("gemini-cli"), lh_event::AgentKind::GeminiCli));
+        assert!(matches!(parse_agent_kind("goose"), lh_event::AgentKind::Goose));
+        assert!(matches!(parse_agent_kind("opencode"), lh_event::AgentKind::OpenCode));
+        assert!(matches!(parse_agent_kind("my-custom-thing"), lh_event::AgentKind::Custom { name } if name == "my-custom-thing"));
     }
 }

@@ -38,6 +38,9 @@ impl Drop for TerminalGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let primary = dispatch::parse_primary_arg(&args)?;
+
     let cwd = std::env::current_dir()?;
     let sock_path = default_socket_path(&cwd);
 
@@ -48,6 +51,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
+    app.primary = primary;
     dispatch::start_handshake(&mut client, &mut app).await?;
 
     let mut ct_events = EventStream::new();
