@@ -842,6 +842,24 @@ mod tests {
         }
     }
 
+    fn text_and_tool_use_response(text: &str, call_id: &str, tool: &str, input: serde_json::Value) -> ModelResponse {
+        ModelResponse {
+            content: vec![
+                ChatContent::Text(text.to_string()),
+                ChatContent::ToolUse {
+                    id: call_id.to_string(),
+                    name: tool.to_string(),
+                    input,
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: ModelUsage {
+                input_tokens: Some(15),
+                output_tokens: Some(6),
+            },
+        }
+    }
+
     async fn local_plane(workspace_root: &std::path::Path) -> Arc<dyn ExecutionPlane> {
         Arc::new(
             lh_execution::LocalExecutionPlane::new(workspace_root.to_path_buf())
@@ -929,13 +947,9 @@ mod tests {
             ]
         );
 
-        let EventPayload::ToolCallUpdated { status, output, .. } = &events[4].payload else {
-            panic!("expected ToolCallUpdated");
-        };
+        let EventPayload::ToolCallUpdated { status, output, .. } = &events[4].payload else { panic!("expected ToolCallUpdated") };
         assert_eq!(*status, ToolCallStatus::Completed);
-        let ContentBlock::Text { text } = output.as_ref().unwrap() else {
-            panic!("expected text output");
-        };
+        let ContentBlock::Text { text } = output.as_ref().unwrap() else { panic!("expected text output") };
         assert!(text.contains("hello from disk"));
     }
 
@@ -981,9 +995,7 @@ mod tests {
             .iter()
             .find(|e| matches!(e.payload, EventPayload::ToolCallUpdated { .. }))
             .unwrap();
-        let EventPayload::ToolCallUpdated { status, .. } = &update.payload else {
-            unreachable!()
-        };
+        let EventPayload::ToolCallUpdated { status, .. } = &update.payload else { unreachable!() };
         assert_eq!(*status, ToolCallStatus::Cancelled);
     }
 
@@ -1164,33 +1176,23 @@ mod tests {
             ]
         );
 
-        let EventPayload::ChildSessionSpawned { child, kind, .. } = &parent_events[4].payload else {
-            panic!("expected ChildSessionSpawned");
-        };
+        let EventPayload::ChildSessionSpawned { child, kind, .. } = &parent_events[4].payload else { panic!("expected ChildSessionSpawned") };
         assert!(matches!(kind, ChildKind::NativeSubagent { role } if role == "researcher"));
         let child_session_id = *child;
 
-        let EventPayload::ChildSessionEnded { outcome, .. } = &parent_events[5].payload else {
-            panic!("expected ChildSessionEnded");
-        };
+        let EventPayload::ChildSessionEnded { outcome, .. } = &parent_events[5].payload else { panic!("expected ChildSessionEnded") };
         assert!(matches!(outcome, ChildOutcome::Success { summary } if summary == "42"));
 
-        let EventPayload::ToolCallUpdated { status, output, .. } = &parent_events[6].payload else {
-            panic!("expected ToolCallUpdated");
-        };
+        let EventPayload::ToolCallUpdated { status, output, .. } = &parent_events[6].payload else { panic!("expected ToolCallUpdated") };
         assert_eq!(*status, ToolCallStatus::Completed);
-        let ContentBlock::Text { text } = output.as_ref().unwrap() else {
-            panic!("expected text output");
-        };
+        let ContentBlock::Text { text } = output.as_ref().unwrap() else { panic!("expected text output") };
         assert_eq!(text, "42", "the subagent's answer must be what feeds back to the parent's model");
 
         // The child got its own fresh session -- never the parent's transcript.
         let child_events = store.read_from(child_session_id, 0).await.unwrap();
         let child_kinds: Vec<&str> = child_events.iter().map(payload_kind).collect();
         assert_eq!(child_kinds, vec!["SessionDriverSet", "UserMessage", "AgentMessageChunk", "UsageReported"]);
-        let EventPayload::UserMessage { content } = &child_events[1].payload else {
-            panic!("expected UserMessage");
-        };
+        let EventPayload::UserMessage { content } = &child_events[1].payload else { panic!("expected UserMessage") };
         let ContentBlock::Text { text } = &content[0] else { panic!("expected text") };
         assert_eq!(text, "find the answer", "child sees only its own instructions, not the parent's prompt");
 
@@ -1362,6 +1364,469 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_output_with_a_missing_bash_id_argument_is_a_clean_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+        let agent = NativeAgentLoop::new(
+            store,
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            registry,
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(SessionId::now_v7(), "call_1", "bash_output", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(is_error, "got: {out}");
+        assert!(out.contains("requires 'bash_id'"), "got: {out}");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "only called for bash_output/bash_wait/bash_kill")]
+    async fn query_background_process_refuses_a_tool_name_it_does_not_own() {
+        // handle_one_tool_call only ever routes bash_output/bash_wait/bash_kill
+        // to this method; calling it directly with anything else must trip
+        // the unreachable! guard, not silently misbehave.
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+        let agent = NativeAgentLoop::new(
+            store,
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            registry,
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (bash_id, _) = agent
+            .handle_one_tool_call(
+                SessionId::now_v7(),
+                "call_1",
+                "bash_background",
+                &serde_json::json!({"command": "true"}),
+            )
+            .await
+            .unwrap();
+
+        agent.query_background_process("bash_frobnicate", &serde_json::json!({"bash_id": bash_id})).await;
+    }
+
+    #[tokio::test]
+    async fn bash_background_with_a_missing_command_argument_is_a_clean_error_not_a_panic() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+        let agent = NativeAgentLoop::new(
+            store,
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            registry.clone(),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(SessionId::now_v7(), "call_1", "bash_background", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(is_error, "got: {out}");
+        assert!(out.contains("command"), "got: {out}");
+        assert!(registry.lock().await.is_empty(), "a failed spawn must not register a process");
+    }
+
+    #[tokio::test]
+    async fn read_file_with_a_missing_path_argument_is_a_clean_error_not_a_panic() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let agent = NativeAgentLoop::new(
+            store,
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(SessionId::now_v7(), "call_1", "read_file", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(is_error, "got: {out}");
+        assert!(out.contains("path"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_response_that_narrates_and_calls_a_tool_in_the_same_turn_still_emits_the_narration() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("hello.txt"), "hello from disk").unwrap();
+
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let provider = Arc::new(ScriptedModelProvider::new(vec![
+            text_and_tool_use_response(
+                "Let me check that file.",
+                "call_1",
+                "read_file",
+                serde_json::json!({"path": "hello.txt"}),
+            ),
+            text_response("it says hello from disk"),
+        ]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let session_id = SessionId::now_v7();
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let outcome = agent.run_turn(session_id, "what does hello.txt say?").await.unwrap();
+        assert_eq!(outcome, TurnOutcome::EndTurn);
+
+        let events = store.read_from(session_id, 0).await.unwrap();
+        let narration = events.iter().find_map(|e| match &e.payload {
+            EventPayload::AgentMessageChunk { content: ContentBlock::Text { text } } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            narration.as_deref(),
+            Some("Let me check that file."),
+            "the model's narration alongside a tool call must still be surfaced, not swallowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_with_missing_role_or_instructions_is_a_clean_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+        let session_id = SessionId::now_v7();
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(session_id, "call_1", "spawn_subagent", &serde_json::json!({"role": "worker"}))
+            .await
+            .unwrap();
+        assert!(is_error, "got: {out}");
+        assert!(out.contains("requires 'role' and 'instructions'"), "got: {out}");
+
+        assert!(
+            store
+                .read_from(session_id, 0)
+                .await
+                .unwrap()
+                .iter()
+                .all(|e| !matches!(e.payload, EventPayload::ChildSessionSpawned { .. })),
+            "a malformed spawn_subagent call must never create a child session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subagent_that_never_finishes_its_own_turn_is_reported_as_a_failed_child() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("hello.txt"), "hello from disk").unwrap();
+
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        // The child's own iteration cap (max_turns: 1) is reached while
+        // it's still mid-tool-call, never producing a plain end-of-turn
+        // response.
+        let provider = Arc::new(ScriptedModelProvider::new(vec![tool_use_response(
+            "child_call_1",
+            "read_file",
+            serde_json::json!({"path": "hello.txt"}),
+        )]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let session_id = SessionId::now_v7();
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(
+                session_id,
+                "call_1",
+                "spawn_subagent",
+                &serde_json::json!({"role": "worker", "instructions": "read the file", "max_turns": 1}),
+            )
+            .await
+            .unwrap();
+        assert!(!is_error, "run_subagent always reports Ok even when the child itself failed; got: {out}");
+        assert!(out.contains("subagent exceeded its turn limit"), "got: {out}");
+
+        let events = store.read_from(session_id, 0).await.unwrap();
+        let spawned = events.iter().find(|e| matches!(e.payload, EventPayload::ChildSessionSpawned { .. })).unwrap();
+        let EventPayload::ChildSessionSpawned { child, .. } = &spawned.payload else { unreachable!() };
+        let child_events = store.read_from(*child, 0).await.unwrap();
+        assert!(
+            child_events.iter().any(|e| payload_kind(e) == "Error"),
+            "the child's own run_turn must have logged its iteration-cap error to its own session"
+        );
+
+        let ended = events.iter().find(|e| matches!(e.payload, EventPayload::ChildSessionEnded { .. })).unwrap();
+        let EventPayload::ChildSessionEnded { outcome, .. } = &ended.payload else { unreachable!() };
+        assert!(matches!(outcome, ChildOutcome::Failed { message } if message.contains("exceeded its turn limit")));
+    }
+
+    #[tokio::test]
+    async fn a_subagent_whose_first_model_call_fails_is_reported_as_a_failed_child() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        // Nothing scripted at all: the child's very first `complete()` call
+        // finds an empty queue and errors out immediately.
+        let provider = Arc::new(ScriptedModelProvider::new(vec![]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let session_id = SessionId::now_v7();
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(
+                session_id,
+                "call_1",
+                "spawn_subagent",
+                &serde_json::json!({"role": "worker", "instructions": "do the thing"}),
+            )
+            .await
+            .unwrap();
+        assert!(!is_error, "run_subagent always reports Ok even when the child itself errored; got: {out}");
+        assert!(out.contains("subagent failed"), "got: {out}");
+        assert!(out.contains("script exhausted"), "got: {out}");
+    }
+
+    struct FailingOnChildSpawnStore {
+        inner: Arc<SqliteSessionStore>,
+    }
+
+    /// Fails only the append that starts a child session, leaving every
+    /// other append (the ordinary ToolCallRequested/PermissionRequested/
+    /// PermissionDecided emits that precede it) to succeed normally --
+    /// proves `run_subagent`'s `Err(e)` arm is reachable from a real store
+    /// failure, not just theoretically present for exhaustiveness.
+    #[async_trait]
+    impl SessionStore for FailingOnChildSpawnStore {
+        async fn append(&self, event: Event) -> lh_store::Result<u64> {
+            if matches!(event.payload, EventPayload::ChildSessionSpawned { .. }) {
+                return Err(lh_store::StoreError::Serde(
+                    serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+                ));
+            }
+            self.inner.append(event).await
+        }
+
+        async fn read_from(&self, session_id: SessionId, from_seq: u64) -> lh_store::Result<Vec<Event>> {
+            self.inner.read_from(session_id, from_seq).await
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Event> {
+            self.inner.subscribe()
+        }
+
+        async fn session_tree(&self, root: SessionId) -> lh_store::Result<lh_store::SessionTreeNode> {
+            self.inner.session_tree(root).await
+        }
+
+        async fn latest_seq(&self, session_id: SessionId) -> lh_store::Result<u64> {
+            self.inner.latest_seq(session_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_failure_while_spawning_a_child_surfaces_as_a_failed_tool_call_not_a_panic() {
+        let workspace = tempfile::tempdir().unwrap();
+        let inner = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(FailingOnChildSpawnStore { inner });
+        let provider = Arc::new(ScriptedModelProvider::new(vec![]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let session_id = SessionId::now_v7();
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (out, is_error) = agent
+            .handle_one_tool_call(
+                session_id,
+                "call_1",
+                "spawn_subagent",
+                &serde_json::json!({"role": "worker", "instructions": "do the thing"}),
+            )
+            .await
+            .unwrap();
+        assert!(is_error, "got: {out}");
+        assert!(out.contains("serialization error"), "got: {out}");
+
+        // The rest of FailingOnChildSpawnStore is a plain pass-through --
+        // exercise it too, since the ordinary non-ChildSessionSpawned
+        // appends above (ToolCallRequested, PermissionRequested, ...)
+        // already prove `append` delegates correctly.
+        assert!(!store.read_from(session_id, 0).await.unwrap().is_empty());
+        assert_eq!(store.session_tree(session_id).await.unwrap().session_id, session_id);
+        assert!(store.latest_seq(session_id).await.unwrap() > 0);
+        drop(store.subscribe());
+    }
+
+    #[test]
+    fn usage_accumulator_marks_any_unknown_the_moment_a_call_is_missing_token_counts() {
+        let mut acc = UsageAccumulator::default();
+
+        // Neither side has ever reported anything -- the (None, None) arms.
+        acc.add(ModelUsage { input_tokens: None, output_tokens: None }, 5);
+        assert!(acc.any_unknown);
+        assert_eq!(acc.input_tokens, None);
+        assert_eq!(acc.output_tokens, None);
+
+        // A later call that does report tokens still sets them.
+        acc.add(ModelUsage { input_tokens: Some(10), output_tokens: Some(4) }, 5);
+        assert_eq!(acc.input_tokens, Some(10));
+        assert_eq!(acc.output_tokens, Some(4));
+
+        // A call after that with no usage at all must flip any_unknown via
+        // the (Some(_), None) arms, not silently drop what was accumulated.
+        acc.add(ModelUsage { input_tokens: None, output_tokens: None }, 5);
+        assert_eq!(acc.input_tokens, Some(10), "a call with no usage must not erase tokens already accumulated");
+        assert_eq!(acc.output_tokens, Some(4));
+        assert!(acc.any_unknown);
+        assert_eq!(acc.wall_ms, 15);
+
+        let delta = acc.finish("anthropic", "test-model", &lh_ledger::PricingTable::new());
+        assert_eq!(delta.confidence, UsageConfidence::Unknown, "any missing token count must taint the whole turn");
+    }
+
+    #[test]
+    fn worse_confidence_returns_whichever_side_is_less_confident() {
+        assert_eq!(worse(UsageConfidence::Exact, UsageConfidence::Exact), UsageConfidence::Exact);
+        assert_eq!(worse(UsageConfidence::Exact, UsageConfidence::Estimated), UsageConfidence::Estimated);
+        assert_eq!(worse(UsageConfidence::Estimated, UsageConfidence::Exact), UsageConfidence::Estimated);
+        assert_eq!(worse(UsageConfidence::Estimated, UsageConfidence::Unknown), UsageConfidence::Unknown);
+    }
+
+    #[test]
+    fn scripted_model_provider_reports_tool_calling_capability() {
+        let provider = ScriptedModelProvider::new(vec![]);
+        let caps = provider.describe();
+        assert!(caps.tool_calling);
+        assert!(!caps.streaming);
+        assert!(caps.reports_usage);
+    }
+
+    #[test]
+    fn payload_kind_names_variants_this_crate_never_itself_produces() {
+        // NativeAgentLoop never emits AgentThoughtChunk/SessionForked/
+        // SessionResumed itself (those belong to other drivers and to
+        // session-fork/resume operations elsewhere), but payload_kind must
+        // still name them correctly for whatever else reads the shared
+        // event log through it.
+        let thought = Event::new(
+            SessionId::now_v7(),
+            None,
+            Actor::Agent,
+            EventPayload::AgentThoughtChunk { content: ContentBlock::text("thinking") },
+        );
+        assert_eq!(payload_kind(&thought), "AgentThoughtChunk");
+
+        let forked = Event::new(
+            SessionId::now_v7(),
+            None,
+            Actor::System,
+            EventPayload::SessionForked { from_seq: 3, new_session: SessionId::now_v7() },
+        );
+        assert_eq!(payload_kind(&forked), "SessionForked");
+
+        let resumed =
+            Event::new(SessionId::now_v7(), None, Actor::System, EventPayload::SessionResumed { at_seq: 7 });
+        assert_eq!(payload_kind(&resumed), "SessionResumed");
+    }
+
+    #[tokio::test]
     async fn plan_update_emits_a_plan_updated_event_with_no_permission_ask() {
         let workspace = tempfile::tempdir().unwrap();
         let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
@@ -1414,6 +1879,7 @@ mod tests {
         assert_eq!(plan[0].description, "find the bug");
         assert_eq!(plan[0].status, lh_event::PlanStepStatus::InProgress);
         assert_eq!(plan[1].status, lh_event::PlanStepStatus::Pending);
+        assert!(events.iter().any(|e| payload_kind(e) == "PlanUpdated"));
     }
 
     #[tokio::test]
