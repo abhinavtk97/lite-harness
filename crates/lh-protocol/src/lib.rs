@@ -485,4 +485,107 @@ mod tests {
         let parsed: Message = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Message::Response(_)));
     }
+
+    // `LITE_HARNESS_DAEMON_BIN` is process-global state, so these tests
+    // serialize on it -- otherwise a parallel test run could read another
+    // test's override.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn real_daemon_bin() -> std::path::PathBuf {
+        // Sibling workspace binary, not a dependency of this crate.
+        // Requires `cargo test --workspace` to have built it.
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target/debug/lite-harnessd")
+    }
+
+    #[test]
+    fn daemon_binary_path_respects_the_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("LITE_HARNESS_DAEMON_BIN", "/some/override/path");
+        let got = daemon_binary_path().unwrap();
+        std::env::remove_var("LITE_HARNESS_DAEMON_BIN");
+        assert_eq!(got, std::path::PathBuf::from("/some/override/path"));
+    }
+
+    #[test]
+    fn daemon_binary_path_falls_back_to_the_sibling_of_the_current_exe() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("LITE_HARNESS_DAEMON_BIN");
+        let got = daemon_binary_path().unwrap();
+        let name = if cfg!(windows) { "lite-harnessd.exe" } else { "lite-harnessd" };
+        assert_eq!(got.file_name().unwrap().to_str().unwrap(), name);
+    }
+
+    #[tokio::test]
+    async fn connect_or_spawn_connects_directly_if_something_is_already_listening() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("already-listening.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let accept_task = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        // No daemon binary override needed at all -- this path never looks
+        // at `daemon_binary_path()` because it never has to spawn anything.
+        let stream = connect_or_spawn(&sock_path).await.unwrap();
+        drop(stream);
+        accept_task.await.unwrap();
+    }
+
+    /// Scans `/proc` for a `lite-harnessd` process whose cwd is exactly
+    /// `workspace` and sends it SIGTERM. Precise cwd matching (rather than
+    /// killing every process named `lite-harnessd`) matters because other
+    /// test binaries in this workspace spawn real daemons of their own,
+    /// potentially concurrently -- an unscoped kill would make those tests
+    /// flaky.
+    fn kill_daemon_with_cwd(workspace: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir("/proc") else { return };
+        for entry in entries.flatten() {
+            let pid = entry.file_name();
+            let pid = pid.to_string_lossy();
+            if !pid.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else { continue };
+            if comm.trim() != "lite-harnessd" {
+                continue;
+            }
+            if std::fs::read_link(entry.path().join("cwd")).ok().as_deref() != Some(workspace) {
+                continue;
+            }
+            let _ = std::process::Command::new("kill").args(["-TERM", &pid]).status();
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_or_spawn_spawns_a_real_daemon_when_nothing_is_listening() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let canonical_workspace = workspace.path().canonicalize().unwrap();
+        let sock_path = default_socket_path(&canonical_workspace);
+
+        // connect_or_spawn spawns the daemon inheriting *this test
+        // process's* current_dir (it takes no cwd argument, matching
+        // lite-harnessd's own real startup: both derive the socket path
+        // from `std::env::current_dir()`). Save/restore around the chdir
+        // since this mutates process-global state; safe under ENV_LOCK
+        // because no other test in this file depends on cwd.
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&workspace).unwrap();
+        std::env::set_var("LITE_HARNESS_DAEMON_BIN", real_daemon_bin());
+        std::env::set_var("HOME", home.path());
+        std::env::remove_var("LITE_HARNESS_PROVIDERS_FILE");
+        std::env::remove_var("LITE_HARNESS_AGENTS_FILE");
+
+        let result = connect_or_spawn(&sock_path).await;
+
+        std::env::set_current_dir(&original_cwd).unwrap();
+        std::env::remove_var("LITE_HARNESS_DAEMON_BIN");
+        kill_daemon_with_cwd(&canonical_workspace);
+
+        result.unwrap();
+    }
 }

@@ -232,6 +232,14 @@ fn spawn_read_loop(
                 }
             }
         }
+
+        // The agent process exited (or sent unparsable output) with calls
+        // still in flight -- drop their senders so each corresponding
+        // `call()`'s `rx.await` resolves to `Err` (-> ConnectionClosed)
+        // instead of hanging forever. Without this, `pending`'s Arc stays
+        // alive via AcpConnection's own clone even after this loop ends,
+        // so nothing would otherwise wake those callers up.
+        pending.lock().await.clear();
     });
 }
 

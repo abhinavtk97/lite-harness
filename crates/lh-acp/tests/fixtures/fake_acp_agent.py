@@ -14,6 +14,26 @@ A prompt containing "USE_TERMINAL" instead drives the full terminal/*
 lifecycle (create -> output while still running -> wait_for_exit ->
 release), exercising the client's terminal capability the same way a real
 agent using its own background-bash feature over ACP would.
+
+A prompt containing "USE_KILL" creates a long-running terminal and kills it
+with terminal/kill instead of waiting for it to exit naturally.
+
+A prompt containing "USE_FS" drives fs/write_text_file followed by
+fs/read_text_file, exercising the client's filesystem capability.
+
+A prompt containing "USE_UNKNOWN_METHOD" sends the client a request for a
+method it has no handler for, exercising the "method not found" fallback.
+
+A prompt containing "USE_CANCEL" or "USE_REFUSAL" responds to session/prompt
+with stopReason "cancelled"/"refusal" instead of "end_turn", exercising the
+non-success ChildOutcome branches.
+
+A prompt containing "USE_AGENT_ERROR" replies to session/prompt with a
+JSON-RPC error instead of a result, exercising AcpConnection::call's
+Agent-error path.
+
+A prompt containing "USE_CRASH" exits the process immediately without
+responding at all, exercising AcpConnection::call's ConnectionClosed path.
 """
 import json
 import sys
@@ -108,6 +128,101 @@ def main():
 
                 respond(req_id, {"stopReason": "end_turn"})
                 continue
+
+            if "USE_KILL" in prompt_text:
+                send({
+                    "jsonrpc": "2.0",
+                    "id": "term-create-2",
+                    "method": "terminal/create",
+                    "params": {
+                        "sessionId": session_id,
+                        "command": "sleep",
+                        "args": ["30"],
+                    },
+                })
+                create_resp = read()
+                terminal_id = create_resp["result"]["terminalId"]
+
+                send({
+                    "jsonrpc": "2.0",
+                    "id": "term-kill-1",
+                    "method": "terminal/kill",
+                    "params": {"sessionId": session_id, "terminalId": terminal_id},
+                })
+                kill_resp = read()
+                sys.stderr.write(f"[fake-agent] kill: {kill_resp}\n")
+
+                send({
+                    "jsonrpc": "2.0",
+                    "id": "term-release-2",
+                    "method": "terminal/release",
+                    "params": {"sessionId": session_id, "terminalId": terminal_id},
+                })
+                release_resp = read()
+                sys.stderr.write(f"[fake-agent] release after kill: {release_resp}\n")
+
+                respond(req_id, {"stopReason": "end_turn"})
+                continue
+
+            if "USE_FS" in prompt_text:
+                # The test passes the absolute path to exercise via a
+                # "PATH:<path>" marker in the prompt text itself.
+                marker = "PATH:"
+                idx = prompt_text.find(marker)
+                file_path = prompt_text[idx + len(marker):].strip() if idx != -1 else "/tmp/does-not-matter"
+
+                send({
+                    "jsonrpc": "2.0",
+                    "id": "fs-write-1",
+                    "method": "fs/write_text_file",
+                    "params": {"sessionId": session_id, "path": file_path, "content": "written via acp"},
+                })
+                write_resp = read()
+                sys.stderr.write(f"[fake-agent] write: {write_resp}\n")
+
+                send({
+                    "jsonrpc": "2.0",
+                    "id": "fs-read-1",
+                    "method": "fs/read_text_file",
+                    "params": {"sessionId": session_id, "path": file_path},
+                })
+                read_resp = read()
+                sys.stderr.write(f"[fake-agent] read: {read_resp}\n")
+
+                respond(req_id, {"stopReason": "end_turn"})
+                continue
+
+            if "USE_UNKNOWN_METHOD" in prompt_text:
+                send({
+                    "jsonrpc": "2.0",
+                    "id": "unknown-1",
+                    "method": "totally/unsupported_method",
+                    "params": {},
+                })
+                unknown_resp = read()
+                sys.stderr.write(f"[fake-agent] unknown method response: {unknown_resp}\n")
+
+                respond(req_id, {"stopReason": "end_turn"})
+                continue
+
+            if "USE_CANCEL" in prompt_text:
+                respond(req_id, {"stopReason": "cancelled"})
+                continue
+
+            if "USE_REFUSAL" in prompt_text:
+                respond(req_id, {"stopReason": "refusal"})
+                continue
+
+            if "USE_AGENT_ERROR" in prompt_text:
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32000, "message": "the fake agent was told to fail this turn"},
+                })
+                continue
+
+            if "USE_CRASH" in prompt_text:
+                sys.exit(1)
 
             notify("session/update", {
                 "sessionId": session_id,

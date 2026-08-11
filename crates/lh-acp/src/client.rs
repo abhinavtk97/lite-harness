@@ -537,6 +537,30 @@ mod tests {
         }
     }
 
+    struct AlwaysDeny;
+
+    #[async_trait]
+    impl PermissionPrompter for AlwaysDeny {
+        async fn ask(&self, _request: &PermissionRequest) -> lh_permission::Result<PermissionDecision> {
+            Ok(PermissionDecision::Deny)
+        }
+    }
+
+    async fn test_client(workspace: &std::path::Path, prompter: Arc<dyn PermissionPrompter>) -> HarnessAcpClient {
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let permission_engine: Arc<dyn PermissionEngine> = Arc::new(DefaultPermissionEngine::new(prompter));
+        let execution_plane: Arc<dyn ExecutionPlane> =
+            Arc::new(lh_execution::LocalExecutionPlane::new(workspace.to_path_buf()).await.unwrap());
+        HarnessAcpClient::new(
+            SessionId::now_v7(),
+            AgentKind::ClaudeCode,
+            store,
+            permission_engine,
+            execution_plane,
+            workspace.to_path_buf(),
+        )
+    }
+
     fn destructive_permission_request(call_id: &str) -> acp::RequestPermissionRequest {
         let fields = acp::ToolCallUpdateFields::new()
             .kind(Some(acp::ToolKind::Delete))
@@ -592,6 +616,89 @@ mod tests {
         assert_eq!(infer_risk_tier(acp::ToolKind::Execute), RiskTier::Execute);
         assert_eq!(infer_risk_tier(acp::ToolKind::Delete), RiskTier::Destructive);
         assert_eq!(infer_risk_tier(acp::ToolKind::Read), RiskTier::Read);
+    }
+
+    /// `fs/write_text_file` then `fs/read_text_file` -- both go through the
+    /// identical `PermissionEngine` native reads/writes use (architecture
+    /// §6: no special-cased "ACP file access is always fine" path).
+    #[tokio::test]
+    async fn fs_write_then_read_round_trips_through_the_permission_engine() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = test_client(workspace.path(), Arc::new(AlwaysAllowAlways { calls: AtomicUsize::new(0) })).await;
+        let abs_path = workspace.path().join("acp_fs_test.txt");
+
+        client
+            .handle_write_text_file(acp::WriteTextFileRequest::new("fake-session", abs_path.clone(), "hello from acp"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&abs_path).unwrap(), "hello from acp");
+
+        let read_resp = client.handle_read_text_file(acp::ReadTextFileRequest::new("fake-session", abs_path)).await.unwrap();
+        assert_eq!(read_resp.content, "hello from acp");
+    }
+
+    #[tokio::test]
+    async fn fs_read_and_write_are_denied_by_policy() {
+        let workspace = tempfile::tempdir().unwrap();
+        let abs_path = workspace.path().join("acp_fs_denied.txt");
+        std::fs::write(&abs_path, "pre-existing").unwrap();
+
+        let client = test_client(workspace.path(), Arc::new(AlwaysDeny)).await;
+
+        let write_err = client
+            .handle_write_text_file(acp::WriteTextFileRequest::new("fake-session", abs_path.clone(), "nope"))
+            .await
+            .unwrap_err();
+        assert!(write_err.to_string().contains("write denied"), "got: {write_err}");
+        // The deny must actually have prevented the write, not just
+        // returned an error while writing anyway.
+        assert_eq!(std::fs::read_to_string(&abs_path).unwrap(), "pre-existing");
+
+        let read_err =
+            client.handle_read_text_file(acp::ReadTextFileRequest::new("fake-session", abs_path)).await.unwrap_err();
+        assert!(read_err.to_string().contains("read denied"), "got: {read_err}");
+    }
+
+    #[tokio::test]
+    async fn terminal_handle_for_an_unknown_id_is_a_clear_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = test_client(workspace.path(), Arc::new(AlwaysAllowAlways { calls: AtomicUsize::new(0) })).await;
+
+        let err = client
+            .handle_terminal_output(acp::TerminalOutputRequest::new("fake-session", "nonexistent-terminal"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown or already-released terminal id"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kill_terminal_stops_a_running_process() {
+        let workspace = tempfile::tempdir().unwrap();
+        let client = test_client(workspace.path(), Arc::new(AlwaysAllowAlways { calls: AtomicUsize::new(0) })).await;
+
+        let create_resp = client
+            .handle_terminal_create(acp::CreateTerminalRequest::new("fake-session", "sleep").args(vec!["30".to_string()]))
+            .await
+            .unwrap();
+
+        client.handle_kill_terminal(acp::KillTerminalRequest::new("fake-session", create_resp.terminal_id.clone())).await.unwrap();
+
+        // `kill()` only signals the process; reaping happens on a separate
+        // task, so wait_for_exit is the deterministic way to observe it
+        // rather than racing terminal/output against that task.
+        client
+            .handle_wait_for_terminal_exit(acp::WaitForTerminalExitRequest::new(
+                "fake-session",
+                create_resp.terminal_id.clone(),
+            ))
+            .await
+            .unwrap();
+
+        let output = client
+            .handle_terminal_output(acp::TerminalOutputRequest::new("fake-session", create_resp.terminal_id))
+            .await
+            .unwrap();
+        assert!(output.exit_status.is_some(), "killed process must report an exit status");
     }
 
     /// Previously the fallthrough `_ => None` silently dropped an incoming

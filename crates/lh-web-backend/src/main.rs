@@ -27,6 +27,12 @@ async fn main() -> anyhow::Result<()> {
         cwd.display()
     );
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            sigterm.recv().await;
+            eprintln!("received SIGTERM, shutting down");
+        })
+        .await?;
     Ok(())
 }
