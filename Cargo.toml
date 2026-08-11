@@ -13,6 +13,7 @@ members = [
     "crates/lh-native-agent",
     "crates/lh-daemon",
     "crates/lh-cli",
+    "crates/lh-web-backend",
 ]
 
 [workspace.package]

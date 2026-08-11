@@ -1,0 +1,16 @@
+[package]
+name = "lh-web-backend"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lite-harness-web"
+path = "src/main.rs"
+
+[dependencies]
+lh-protocol = { path = "../lh-protocol" }
+tokio.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }

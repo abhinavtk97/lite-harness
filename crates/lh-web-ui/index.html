@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lite-harness</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">lite-harness<span class="brand-dim">.web</span></div>
+    <div id="status" class="status status-disconnected">disconnected</div>
+  </header>
+
+  <main class="layout">
+    <section class="setup" id="setup-panel">
+      <h2>Start a session</h2>
+      <label class="field">
+        <span>Driver</span>
+        <select id="driver-select">
+          <option value="native">Native (this daemon's own agent loop)</option>
+          <option value="primary">Primary: an external agent drives the whole session</option>
+          <option value="delegate">Native root, delegate this one prompt to an external agent</option>
+        </select>
+      </label>
+      <label class="field" id="agent-field" hidden>
+        <span>Agent</span>
+        <select id="agent-select"></select>
+      </label>
+      <button id="create-session-btn" type="button">Create session</button>
+      <p class="hint" id="agents-hint"></p>
+    </section>
+
+    <section class="session" id="session-panel" hidden>
+      <div class="session-meta">
+        <span id="session-id-label"></span>
+        <span id="driver-label"></span>
+        <button id="ledger-btn" type="button">Refresh ledger</button>
+      </div>
+
+      <div class="log" id="event-log" aria-live="polite"></div>
+
+      <form class="composer" id="composer-form">
+        <textarea id="prompt-input" placeholder="Send a prompt..." rows="2"></textarea>
+        <button type="submit">Send</button>
+      </form>
+
+      <div class="ledger" id="ledger-panel"></div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="permission-modal" hidden>
+    <div class="modal">
+      <h3>Permission requested</h3>
+      <p id="permission-summary"></p>
+      <pre id="permission-detail"></pre>
+      <div class="modal-actions">
+        <button type="button" data-decision="deny" class="btn-deny">Deny</button>
+        <button type="button" data-decision="deny_always" class="btn-deny-ghost">Always deny</button>
+        <button type="button" data-decision="allow" class="btn-allow">Allow</button>
+        <button type="button" data-decision="allow_always" class="btn-allow-ghost">Always allow</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

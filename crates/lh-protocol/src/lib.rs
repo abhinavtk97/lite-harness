@@ -324,6 +324,70 @@ pub fn default_socket_path(cwd: &std::path::Path) -> std::path::PathBuf {
         .join(format!("{hash:016x}.sock"))
 }
 
+// --- Daemon connection bootstrap ---
+//
+// Shared by every Harness Protocol client that needs to reach a
+// per-workspace daemon and is willing to spawn one if it isn't already
+// running -- `lh-cli` and `lh-web-backend` both do exactly this, so it
+// lives here once rather than twice (the same "no parallel mechanism"
+// discipline applied everywhere else in this project).
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    #[error("io error resolving current executable: {0}")]
+    CurrentExe(#[source] std::io::Error),
+    #[error("current executable has no parent directory")]
+    NoParentDir,
+    #[error("failed to spawn daemon at {path}: {source}")]
+    Spawn {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("timed out waiting for lite-harnessd to start listening at {0}")]
+    Timeout(std::path::PathBuf),
+}
+
+/// Where to find `lite-harnessd`: `LITE_HARNESS_DAEMON_BIN` if set
+/// (e2e/dev override), otherwise the sibling binary next to whichever
+/// executable is calling this.
+pub fn daemon_binary_path() -> Result<std::path::PathBuf, ConnectError> {
+    if let Ok(p) = std::env::var("LITE_HARNESS_DAEMON_BIN") {
+        return Ok(std::path::PathBuf::from(p));
+    }
+    let exe = std::env::current_exe().map_err(ConnectError::CurrentExe)?;
+    let dir = exe.parent().ok_or(ConnectError::NoParentDir)?;
+    let name = if cfg!(windows) { "lite-harnessd.exe" } else { "lite-harnessd" };
+    Ok(dir.join(name))
+}
+
+/// Connects to the daemon at `sock_path`, spawning it first if nothing is
+/// listening yet -- the exact bootstrap every thin client (CLI, web
+/// backend) wants: "just work" on first run, without a separate `daemon
+/// start` step.
+pub async fn connect_or_spawn(sock_path: &std::path::Path) -> Result<tokio::net::UnixStream, ConnectError> {
+    if let Ok(stream) = tokio::net::UnixStream::connect(sock_path).await {
+        return Ok(stream);
+    }
+
+    let daemon_bin = daemon_binary_path()?;
+    eprintln!("no daemon running at {}, starting {}", sock_path.display(), daemon_bin.display());
+    std::process::Command::new(&daemon_bin)
+        .spawn()
+        .map_err(|source| ConnectError::Spawn { path: daemon_bin.clone(), source })?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(stream) = tokio::net::UnixStream::connect(sock_path).await {
+            return Ok(stream);
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(ConnectError::Timeout(sock_path.to_path_buf()));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

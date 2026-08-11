@@ -7,20 +7,18 @@
 //! event" or "forward this human answer back to the daemon."
 
 use std::io::Write;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use lh_event::{AgentKind, ContentBlock, Event, EventPayload, PermissionDecision};
 use lh_protocol::{
-    buffered, default_socket_path, methods, read_message, write_message, AgentsListParams,
-    AgentsListResult, InitializeParams, InitializeResult, LedgerQueryParams, LedgerQueryResult,
-    Message, PermissionAskParams, PermissionAskResult, PrimarySelector, Request, RequestId,
-    Response, SessionCreateParams, SessionCreateResult, SessionDelegateParams,
-    SessionDelegateResult, SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
+    buffered, connect_or_spawn, default_socket_path, methods, read_message, write_message,
+    AgentsListParams, AgentsListResult, InitializeParams, InitializeResult, LedgerQueryParams,
+    LedgerQueryResult, Message, PermissionAskParams, PermissionAskResult, PrimarySelector,
+    Request, RequestId, Response, SessionCreateParams, SessionCreateResult,
+    SessionDelegateParams, SessionDelegateResult, SessionPromptParams, SessionPromptResult,
+    PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
-use tokio::net::UnixStream;
 
 /// `--agent <agent>` (architecture §11 phase 4) hands one task from a
 /// `Native` root to a child via `session/delegate` -- the root session
@@ -290,48 +288,6 @@ async fn request<T: serde::de::DeserializeOwned>(
     }
 }
 
-async fn connect_or_spawn(sock_path: &std::path::Path) -> Result<UnixStream> {
-    if let Ok(stream) = UnixStream::connect(sock_path).await {
-        return Ok(stream);
-    }
-
-    let daemon_bin = daemon_binary_path()?;
-    eprintln!(
-        "no daemon running at {}, starting {}",
-        sock_path.display(),
-        daemon_bin.display()
-    );
-    std::process::Command::new(&daemon_bin)
-        .spawn()
-        .with_context(|| format!("failed to spawn daemon at {}", daemon_bin.display()))?;
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(stream) = UnixStream::connect(sock_path).await {
-            return Ok(stream);
-        }
-        if Instant::now() > deadline {
-            anyhow::bail!("timed out waiting for lite-harnessd to start listening");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-fn daemon_binary_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("LITE_HARNESS_DAEMON_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-    let exe = std::env::current_exe()?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| anyhow!("current executable has no parent directory"))?;
-    let name = if cfg!(windows) {
-        "lite-harnessd.exe"
-    } else {
-        "lite-harnessd"
-    };
-    Ok(dir.join(name))
-}
 
 async fn ask_for_decision(
     stdin: &mut (impl AsyncBufRead + Unpin),
