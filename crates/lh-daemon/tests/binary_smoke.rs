@@ -38,16 +38,23 @@ async fn the_real_binary_starts_accepts_a_connection_and_shuts_down_on_sigterm()
         .spawn()
         .expect("failed to spawn lite-harnessd");
 
+    // Reuses the first successful connection for the actual round trip
+    // below, rather than probing with one connection and then opening a
+    // second -- the daemon accepting a connection doesn't guarantee a
+    // *second*, separate connect() lands in an available backlog slot at
+    // the exact same instant (confirmed live: this was an intermittent
+    // `ConnectionRefused` on CI, not a hang, so the reconnect -- not the
+    // wait loop itself -- was the actual race).
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if UnixStream::connect(&sock_path).await.is_ok() {
-            break;
+    let stream = loop {
+        match UnixStream::connect(&sock_path).await {
+            Ok(stream) => break stream,
+            Err(_) => {
+                assert!(tokio::time::Instant::now() < deadline, "daemon never started listening");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
-        assert!(tokio::time::Instant::now() < deadline, "daemon never started listening");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    };
     let (r, mut w) = stream.into_split();
     let mut reader = buffered(r);
 
@@ -124,16 +131,23 @@ async fn assert_daemon_starts_and_shuts_down_cleanly(
     let mut child = cmd.spawn().expect("failed to spawn lite-harnessd");
     let mut stderr = child.stderr.take().unwrap();
 
+    // Reuses the first successful connection for the actual round trip
+    // below, rather than probing with one connection and then opening a
+    // second -- the daemon accepting a connection doesn't guarantee a
+    // *second*, separate connect() lands in an available backlog slot at
+    // the exact same instant (confirmed live: this was an intermittent
+    // `ConnectionRefused` on CI, not a hang, so the reconnect -- not the
+    // wait loop itself -- was the actual race).
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if UnixStream::connect(&sock_path).await.is_ok() {
-            break;
+    let stream = loop {
+        match UnixStream::connect(&sock_path).await {
+            Ok(stream) => break stream,
+            Err(_) => {
+                assert!(tokio::time::Instant::now() < deadline, "daemon never started listening");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
-        assert!(tokio::time::Instant::now() < deadline, "daemon never started listening");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    };
     let (r, mut w) = stream.into_split();
     let mut reader = buffered(r);
     write_message(
