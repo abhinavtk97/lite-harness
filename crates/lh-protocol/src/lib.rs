@@ -492,14 +492,35 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn real_daemon_bin() -> std::path::PathBuf {
-        // Sibling workspace binary, not a dependency of this crate.
-        // Requires `cargo test --workspace` to have built it.
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        // Sibling workspace binary, not a dependency of this crate --
+        // lh-protocol is a pure library, so there's no `CARGO_BIN_EXE_*`
+        // available to lean on the way a crate with its own [[bin]] target
+        // could (see lh-cli/lh-web-backend's own test helpers). Requires
+        // `cargo test --workspace` to have built it.
+        //
+        // Which subdirectory it landed in depends on the build tool: plain
+        // `cargo test` and older `cargo-llvm-cov` both build into
+        // `target/debug`, but newer `cargo-llvm-cov` (confirmed: the
+        // version `taiki-e/install-action` pulls in CI, unlike the older
+        // one installed locally in this session) segregates instrumented
+        // builds into `target/llvm-cov-target/debug` instead, to avoid
+        // invalidating the regular build cache. Check both rather than
+        // guessing, so this doesn't silently regress on the next tool
+        // version bump either way.
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap()
-            .join("target/debug/lite-harnessd")
+            .to_path_buf();
+        let name = if cfg!(windows) { "lite-harnessd.exe" } else { "lite-harnessd" };
+        for target_subdir in ["target/llvm-cov-target/debug", "target/debug"] {
+            let candidate = workspace_root.join(target_subdir).join(name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        workspace_root.join("target/debug").join(name)
     }
 
     #[test]

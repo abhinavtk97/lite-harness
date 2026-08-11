@@ -17,13 +17,15 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 fn daemon_bin() -> PathBuf {
     // lite-harnessd is a sibling workspace binary, not a dependency of
     // this crate -- same derivation `lh_protocol::daemon_binary_path()`
-    // uses in production. Requires `cargo test --workspace`.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target/debug/lite-harnessd")
+    // uses in production. Derived from this crate's *own* bin target's
+    // `CARGO_BIN_EXE_*` (guaranteed correct regardless of which target
+    // subdirectory the build tool used -- plain `cargo test` and
+    // `cargo-llvm-cov` versions disagree on this, see lh-protocol's own
+    // `real_daemon_bin` test helper for the version-drift details) rather
+    // than reconstructing the path by hand. Requires `cargo test
+    // --workspace`.
+    PathBuf::from(env!("CARGO_BIN_EXE_lite-harness-web"))
+        .with_file_name(if cfg!(windows) { "lite-harnessd.exe" } else { "lite-harnessd" })
 }
 
 struct DaemonGuard {
