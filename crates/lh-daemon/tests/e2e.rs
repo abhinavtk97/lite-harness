@@ -26,9 +26,9 @@ use lh_permission::TomlPolicyStore;
 use lh_protocol::{
     buffered, methods, read_message, write_message, AgentsListParams, AgentsListResult,
     InitializeParams, InitializeResult, LedgerQueryParams, LedgerQueryResult, Message,
-    PermissionAskParams, PermissionAskResult, PrimarySelector, Request, RequestId, Response,
-    SessionCreateParams, SessionCreateResult, SessionDelegateParams, SessionDelegateResult,
-    SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
+    Notification, PermissionAskParams, PermissionAskResult, PrimarySelector, Request, RequestId,
+    Response, SessionCreateParams, SessionCreateResult, SessionDelegateParams,
+    SessionDelegateResult, SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
 };
 use lh_store::{SessionStore, SqliteSessionStore};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -565,6 +565,53 @@ async fn primary_selector_delegated_round_trips_and_rejects_bad_configs() {
 }
 
 #[tokio::test]
+async fn delegated_primary_prompt_maps_cancelled_and_refusal_stop_reasons() {
+    // `handle_session_prompt_delegated`'s own `stop_reason` match has three
+    // arms (Success/Failed/Cancelled) -- the round trip above only ever
+    // exercises Success. The fake ACP agent fixture (shared with lh-acp's
+    // own tests) understands two magic phrases to force the other two.
+    let workspace = tempfile::tempdir().unwrap();
+
+    let state = DaemonState::new(workspace.path())
+        .await
+        .with_agents(vec![fake_agent_adapter(true, "LH_ACP_DAEMON_TEST_KEY_CANCEL")]);
+    let mut client = state.connect();
+    client.initialize().await;
+    client
+        .create_session(workspace.path(), PrimarySelector::Delegated { agent: AgentKind::ClaudeCode })
+        .await
+        .unwrap();
+    let (result, _events) = client
+        .call_collecting_events(
+            methods::SESSION_PROMPT,
+            serde_json::to_value(SessionPromptParams { text: "USE_CANCEL please".to_string() }).unwrap(),
+            PermissionDecision::Allow,
+        )
+        .await;
+    let prompt_result: SessionPromptResult = serde_json::from_value(result.unwrap()).unwrap();
+    assert_eq!(prompt_result.stop_reason, "Cancelled");
+
+    let state2 = DaemonState::new(workspace.path())
+        .await
+        .with_agents(vec![fake_agent_adapter(true, "LH_ACP_DAEMON_TEST_KEY_REFUSAL")]);
+    let mut client2 = state2.connect();
+    client2.initialize().await;
+    client2
+        .create_session(workspace.path(), PrimarySelector::Delegated { agent: AgentKind::ClaudeCode })
+        .await
+        .unwrap();
+    let (result2, _events2) = client2
+        .call_collecting_events(
+            methods::SESSION_PROMPT,
+            serde_json::to_value(SessionPromptParams { text: "USE_REFUSAL please".to_string() }).unwrap(),
+            PermissionDecision::Allow,
+        )
+        .await;
+    let prompt_result2: SessionPromptResult = serde_json::from_value(result2.unwrap()).unwrap();
+    assert!(prompt_result2.stop_reason.starts_with("Failed:"), "got: {}", prompt_result2.stop_reason);
+}
+
+#[tokio::test]
 async fn dropping_the_connection_before_initialize_or_before_session_create_is_handled_gracefully() {
     let workspace = tempfile::tempdir().unwrap();
 
@@ -622,4 +669,117 @@ async fn wrong_method_or_malformed_params_closes_the_connection_instead_of_hangi
         client.send_request(methods::SESSION_CREATE, serde_json::json!({"primary": {"type": "Native"}})).await;
         assert!(client.recv().await.is_none());
     }
+}
+
+#[tokio::test]
+async fn spontaneous_response_and_notification_in_steady_state_are_logged_and_dont_break_the_connection() {
+    let workspace = tempfile::tempdir().unwrap();
+    let state = DaemonState::new(workspace.path()).await;
+    let mut client = state.connect();
+    client.initialize().await;
+    let created = client.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+
+    // A Response the daemon never actually sent a matching permission/ask
+    // for, and whose result doesn't even parse as a PermissionAskResult --
+    // the steady-state loop treats every inbound Response as an answer to
+    // some permission/ask (it's the only Request the daemon ever sends the
+    // client), so a bad one hits the "failed to parse" eprintln branch
+    // rather than a panic, and the connection must keep working afterward.
+    write_message(
+        &mut client.write_half,
+        &Message::Response(Response::ok(999, serde_json::json!({"not": "a decision"}))),
+    )
+    .await
+    .unwrap();
+
+    // A Notification is neither a Request nor a Response -- covers the
+    // catch-all "[unexpected message]" branch.
+    write_message(
+        &mut client.write_half,
+        &Message::Notification(Notification::new("client/ping", serde_json::json!({}))),
+    )
+    .await
+    .unwrap();
+
+    // Still alive: an ordinary request right after both gets a normal
+    // response -- draining the SessionDriverSet event notification that
+    // session/create's own forwarder streams asynchronously and may not
+    // have been read yet.
+    let id = client.send_request(methods::LEDGER_QUERY, serde_json::to_value(LedgerQueryParams { session_id: created.session_id }).unwrap()).await;
+    let ledger: LedgerQueryResult = loop {
+        match client.recv().await.unwrap() {
+            Message::Notification(n) if n.method == methods::EVENT => continue,
+            Message::Response(resp) => {
+                assert_eq!(resp.id, id);
+                break serde_json::from_value(resp.result.unwrap()).unwrap();
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    };
+    assert_eq!(ledger.rollup.turns, 0);
+}
+
+#[tokio::test]
+async fn events_from_an_unrelated_session_sharing_the_store_are_filtered_by_the_forwarder() {
+    // Two independent connections against the same underlying store (as a
+    // real deployment would have -- one daemon, many client connections) --
+    // connection A's event forwarder must skip over connection B's
+    // session's events (the `Ok(_other_session) => continue` branch) rather
+    // than forwarding everything it sees on the shared broadcast channel.
+    let workspace = tempfile::tempdir().unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+    let execution_plane: Arc<dyn ExecutionPlane> =
+        Arc::new(LocalExecutionPlane::new(workspace.path().to_path_buf()).await.unwrap());
+    let cost_ledger: Arc<dyn CostLedger> = Arc::new(StoreBackedCostLedger::new(store.clone()));
+
+    fn connect(
+        store: Arc<dyn SessionStore>,
+        cost_ledger: Arc<dyn CostLedger>,
+        execution_plane: Arc<dyn ExecutionPlane>,
+    ) -> TestClient {
+        let (server_half, client_half) = UnixStream::pair().unwrap();
+        tokio::spawn(lh_daemon::handle_connection(
+            server_half,
+            store,
+            Arc::new(None),
+            execution_plane,
+            None,
+            None,
+            Arc::new(PricingTable::new()),
+            cost_ledger,
+            Arc::new(AgentsFile::default()),
+        ));
+        TestClient::new(client_half)
+    }
+
+    let mut client_a = connect(store.clone(), cost_ledger.clone(), execution_plane.clone());
+    client_a.initialize().await;
+    let created_a = client_a.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+
+    let mut client_b = connect(store.clone(), cost_ledger.clone(), execution_plane.clone());
+    client_b.initialize().await;
+    let created_b = client_b.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+    assert_ne!(created_a.session_id, created_b.session_id);
+
+    // client_a must still be alive and, once its own SessionDriverSet event
+    // notification is drained, only ever see events for its own session --
+    // client_b's session's event was filtered out by A's forwarder, not
+    // forwarded to A's socket.
+    let id = client_a
+        .send_request(methods::LEDGER_QUERY, serde_json::to_value(LedgerQueryParams { session_id: created_a.session_id }).unwrap())
+        .await;
+    let ledger: LedgerQueryResult = loop {
+        match client_a.recv().await.unwrap() {
+            Message::Notification(n) if n.method == methods::EVENT => {
+                let event: lh_event::Event = serde_json::from_value(n.params).unwrap();
+                assert_eq!(event.session_id, created_a.session_id, "A's forwarder must never leak B's events");
+            }
+            Message::Response(resp) => {
+                assert_eq!(resp.id, id);
+                break serde_json::from_value(resp.result.unwrap()).unwrap();
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    };
+    assert_eq!(ledger.rollup.turns, 0);
 }
