@@ -4,7 +4,10 @@
 //! terminal at all (see `tests` below) and `ui::draw` testable against
 //! `ratatui::backend::TestBackend` with no daemon connection.
 
-use lh_event::{ChildKind, ChildOutcome, ContentBlock, Event, EventPayload, PermissionDecision, PlanStep, SessionId, ToolCallStatus};
+use lh_event::{
+    ChildKind, ChildOutcome, ContentBlock, Event, EventPayload, PermissionAction, PermissionDecision, PermissionRequest,
+    PlanStep, PolicyScope, SessionId, ToolCallStatus,
+};
 use lh_protocol::RequestId;
 
 use crate::input::InputBox;
@@ -39,14 +42,51 @@ pub enum PendingKind {
     Prompt,
 }
 
-/// The transcript already gets a system line describing the request the
-/// moment it arrives (see `main::handle_client_event`) -- all this needs to
-/// carry forward is the id to answer. A richer field re-appears here once
-/// the permission-ask modal (a later phase) actually renders the request
-/// itself rather than relying on that transcript line.
-#[derive(Debug, Clone, Copy)]
+/// The full request is carried (not just its id) so the permission modal
+/// (`ui::draw_permission_modal`) can render the actual risk tier, tool
+/// source, action, and any diff -- `selected` indexes `PermissionChoice::ALL`
+/// and starts on `Deny`, the same fail-safe default the pre-modal y/n
+/// prompt had (any key other than an explicit "allow" denied).
+#[derive(Debug, Clone)]
 pub struct PendingPermission {
     pub request_id: RequestId,
+    pub request: PermissionRequest,
+    pub selected: usize,
+}
+
+/// The four ways a `PermissionRequest` can be answered, in the order the
+/// modal cycles through and displays them -- `Deny` first/default on
+/// purpose (see `PendingPermission`'s doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionChoice {
+    Deny,
+    Allow,
+    AllowAlways,
+    DenyAlways,
+}
+
+impl PermissionChoice {
+    pub const ALL: [PermissionChoice; 4] = [Self::Deny, Self::Allow, Self::AllowAlways, Self::DenyAlways];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Deny => "Deny",
+            Self::Allow => "Allow",
+            Self::AllowAlways => "Always Allow",
+            Self::DenyAlways => "Always Deny",
+        }
+    }
+
+    /// "Always" decisions are scoped to the project -- matches `lh-cli`'s
+    /// own choice for its equivalent y/N/a/d prompt.
+    pub fn decision(&self) -> PermissionDecision {
+        match self {
+            Self::Deny => PermissionDecision::Deny,
+            Self::Allow => PermissionDecision::Allow,
+            Self::AllowAlways => PermissionDecision::AllowAlways { scope: PolicyScope::Project },
+            Self::DenyAlways => PermissionDecision::DenyAlways { scope: PolicyScope::Project },
+        }
+    }
 }
 
 /// A subagent or ACP-delegated child session, tracked for the sidebar's
@@ -206,13 +246,55 @@ impl App {
         self.transcript.push(TranscriptItem::Error(text.into()));
     }
 
-    /// `y`/`n` only for now (Allow/Deny) -- the always-allow/always-deny
-    /// variants and a real modal overlay land with the permission-ask UI
-    /// phase; this keeps the connection from hanging in the meantime.
-    pub fn decide_pending_permission(&mut self, allow: bool) -> Option<(RequestId, PermissionDecision)> {
+    pub fn decide_pending_permission(&mut self, decision: PermissionDecision) -> Option<(RequestId, PermissionDecision)> {
         let pending = self.pending_permission.take()?;
-        let decision = if allow { PermissionDecision::Allow } else { PermissionDecision::Deny };
         Some((pending.request_id, decision))
+    }
+
+    /// Moves the modal's highlighted option; a no-op if nothing's pending.
+    pub fn cycle_permission_selection(&mut self, forward: bool) {
+        if let Some(pending) = self.pending_permission.as_mut() {
+            let n = PermissionChoice::ALL.len();
+            pending.selected = if forward { (pending.selected + 1) % n } else { (pending.selected + n - 1) % n };
+        }
+    }
+
+    pub fn selected_permission_choice(&self) -> Option<PermissionChoice> {
+        self.pending_permission.as_ref().map(|p| PermissionChoice::ALL[p.selected])
+    }
+}
+
+/// Turns a `PermissionAction` into one readable line -- shared by the
+/// transcript's audit-trail summary (`dispatch::handle_client_event`) and
+/// the modal's full detail view (`ui::draw_permission_modal`), so the two
+/// never drift out of sync with each other.
+pub fn describe_permission_action(action: &PermissionAction) -> String {
+    match action {
+        PermissionAction::FileRead { path } => format!("read {}", path.display()),
+        PermissionAction::FileWrite { path, .. } => format!("write {}", path.display()),
+        PermissionAction::Exec { command, .. } => format!("execute: {command}"),
+        PermissionAction::NetworkFetch { url } => format!("fetch {url}"),
+        PermissionAction::McpToolCall { server, tool, .. } => format!("mcp {server}/{tool}"),
+        PermissionAction::DelegatedAgentToolCall { agent, .. } => format!("delegated call via {agent:?}"),
+        PermissionAction::DelegateAgent { target, task_summary } => format!("delegate to {target:?}: {task_summary}"),
+        PermissionAction::SpawnSubagent { role, task_summary } => format!("spawn subagent ({role}): {task_summary}"),
+    }
+}
+
+/// A minimal but realistic `PermissionRequest` -- shared by this module's
+/// own tests and by `dispatch`/`ui`'s test modules (via `crate::app::...`)
+/// so every permission-modal test isn't hand-rolling the same struct.
+#[cfg(test)]
+pub(crate) fn fake_permission_request() -> PermissionRequest {
+    PermissionRequest {
+        session_id: SessionId::now_v7(),
+        tool_source: lh_event::ToolSource::Native { tool_id: "bash".to_string() },
+        action: PermissionAction::Exec {
+            command: "echo hi".to_string(),
+            args: Vec::new(),
+            cwd: std::path::PathBuf::from("."),
+        },
+        risk_tier: lh_event::RiskTier::Execute,
     }
 }
 
@@ -229,7 +311,7 @@ fn render_content(block: &ContentBlock) -> String {
     }
 }
 
-fn source_label(source: &lh_event::ToolSource) -> String {
+pub(crate) fn source_label(source: &lh_event::ToolSource) -> String {
     match source {
         lh_event::ToolSource::Native { tool_id } => format!("native:{tool_id}"),
         lh_event::ToolSource::Mcp { server, tool } => format!("mcp:{server}/{tool}"),
@@ -375,21 +457,121 @@ mod tests {
         assert!(!app.input_enabled());
         app.pending = None;
 
-        app.pending_permission = Some(PendingPermission { request_id: -1 });
+        app.pending_permission = Some(PendingPermission { request_id: -1, request: fake_permission_request(), selected: 0 });
         assert!(!app.input_enabled());
     }
 
     #[test]
-    fn deciding_a_pending_permission_clears_it_and_reports_the_right_decision() {
+    fn deciding_a_pending_permission_clears_it_and_reports_the_given_decision() {
         let mut app = App::new();
-        app.pending_permission = Some(PendingPermission { request_id: -1 });
+        app.pending_permission = Some(PendingPermission { request_id: -1, request: fake_permission_request(), selected: 0 });
 
-        let (id, decision) = app.decide_pending_permission(true).unwrap();
+        let (id, decision) = app.decide_pending_permission(PermissionDecision::Allow).unwrap();
         assert_eq!(id, -1);
         assert!(matches!(decision, PermissionDecision::Allow));
         assert!(app.pending_permission.is_none());
 
-        assert!(app.decide_pending_permission(false).is_none(), "nothing pending, should be a no-op");
+        assert!(
+            app.decide_pending_permission(PermissionDecision::Deny).is_none(),
+            "nothing pending, should be a no-op"
+        );
+    }
+
+    #[test]
+    fn a_pending_permission_defaults_its_selection_to_deny() {
+        let app_selected = PendingPermission { request_id: -1, request: fake_permission_request(), selected: 0 };
+        assert_eq!(PermissionChoice::ALL[app_selected.selected], PermissionChoice::Deny);
+    }
+
+    #[test]
+    fn cycling_the_permission_selection_wraps_in_both_directions() {
+        let mut app = App::new();
+        app.pending_permission = Some(PendingPermission { request_id: -1, request: fake_permission_request(), selected: 0 });
+
+        assert_eq!(app.selected_permission_choice(), Some(PermissionChoice::Deny));
+        app.cycle_permission_selection(true);
+        assert_eq!(app.selected_permission_choice(), Some(PermissionChoice::Allow));
+        app.cycle_permission_selection(false);
+        assert_eq!(app.selected_permission_choice(), Some(PermissionChoice::Deny), "wraps backward past the start");
+        app.cycle_permission_selection(false);
+        assert_eq!(app.selected_permission_choice(), Some(PermissionChoice::DenyAlways), "wraps backward to the end");
+    }
+
+    #[test]
+    fn cycling_the_permission_selection_with_nothing_pending_is_a_no_op() {
+        let mut app = App::new();
+        app.cycle_permission_selection(true);
+        assert!(app.selected_permission_choice().is_none());
+    }
+
+    #[test]
+    fn every_permission_choice_has_a_distinct_label_and_the_right_decision_shape() {
+        assert_eq!(PermissionChoice::Deny.label(), "Deny");
+        assert!(matches!(PermissionChoice::Deny.decision(), PermissionDecision::Deny));
+        assert_eq!(PermissionChoice::Allow.label(), "Allow");
+        assert!(matches!(PermissionChoice::Allow.decision(), PermissionDecision::Allow));
+        assert!(matches!(
+            PermissionChoice::AllowAlways.decision(),
+            PermissionDecision::AllowAlways { scope: PolicyScope::Project }
+        ));
+        assert!(matches!(
+            PermissionChoice::DenyAlways.decision(),
+            PermissionDecision::DenyAlways { scope: PolicyScope::Project }
+        ));
+    }
+
+    #[test]
+    fn describe_permission_action_names_every_variant() {
+        assert_eq!(describe_permission_action(&PermissionAction::FileRead { path: "a.txt".into() }), "read a.txt");
+        assert_eq!(
+            describe_permission_action(&PermissionAction::FileWrite { path: "b.txt".into(), diff_summary: None }),
+            "write b.txt"
+        );
+        assert_eq!(
+            describe_permission_action(&PermissionAction::Exec {
+                command: "ls".to_string(),
+                args: vec![],
+                cwd: ".".into()
+            }),
+            "execute: ls"
+        );
+        assert_eq!(
+            describe_permission_action(&PermissionAction::NetworkFetch { url: "https://x".to_string() }),
+            "fetch https://x"
+        );
+        assert_eq!(
+            describe_permission_action(&PermissionAction::McpToolCall {
+                server: "web".to_string(),
+                tool: "search".to_string(),
+                args_summary: serde_json::json!({}),
+            }),
+            "mcp web/search"
+        );
+        assert!(describe_permission_action(&PermissionAction::DelegatedAgentToolCall {
+            agent: lh_event::AgentKind::ClaudeCode,
+            acp_tool_call: Box::new(lh_event::ToolCall {
+                call_id: "c".to_string(),
+                tool_name: "edit".to_string(),
+                source: lh_event::ToolSource::Acp { agent: lh_event::AgentKind::ClaudeCode },
+                args_summary: serde_json::json!({}),
+                raw_args: serde_json::json!({}),
+            }),
+        })
+        .contains("ClaudeCode"));
+        assert_eq!(
+            describe_permission_action(&PermissionAction::DelegateAgent {
+                target: lh_event::AgentKind::ClaudeCode,
+                task_summary: "do it".to_string()
+            }),
+            "delegate to ClaudeCode: do it"
+        );
+        assert_eq!(
+            describe_permission_action(&PermissionAction::SpawnSubagent {
+                role: "researcher".to_string(),
+                task_summary: "look into it".to_string()
+            }),
+            "spawn subagent (researcher): look into it"
+        );
     }
 
     #[test]

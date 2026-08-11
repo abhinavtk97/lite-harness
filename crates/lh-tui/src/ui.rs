@@ -3,14 +3,14 @@
 //! what lets it be tested against `ratatui::backend::TestBackend` with no
 //! real terminal and no daemon connection (see `tests` below).
 
-use lh_event::{ChildKind, ChildOutcome, PlanStepStatus};
+use lh_event::{ChildKind, ChildOutcome, PermissionAction, PlanStepStatus};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ConnPhase, TranscriptItem};
+use crate::app::{describe_permission_action, App, ConnPhase, PendingPermission, PermissionChoice, TranscriptItem};
 
 /// Highest input box height (in text lines, before the +2 for borders) --
 /// a multi-line prompt can grow the input box, but not so far that it
@@ -32,6 +32,82 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_main(frame, chunks[0], app);
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], app);
+
+    // Drawn last, over everything else -- a modal, not another pane.
+    if let Some(pending) = &app.pending_permission {
+        draw_permission_modal(frame, frame.area(), pending);
+    }
+}
+
+/// A `Rect` centered within `area`, `percent_x`/`percent_y` of its size --
+/// the standard ratatui popup-centering recipe.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermission) {
+    let popup = centered_rect(70, 60, area);
+    // Without this, the modal would be alpha-blended onto whatever the
+    // transcript/sidebar already drew there -- `Clear` erases the cells
+    // first so the popup reads as solid, not a ghostly overlay.
+    frame.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("{:?} risk -- {}", pending.request.risk_tier, crate::app::source_label(&pending.request.tool_source)),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(describe_permission_action(&pending.request.action)),
+    ];
+
+    if let PermissionAction::FileWrite { diff_summary: Some(diff), .. } = &pending.request.action {
+        lines.push(Line::from(""));
+        for diff_line in diff.lines() {
+            lines.push(Line::from(Span::styled(diff_line.to_string(), Style::default().fg(Color::DarkGray))));
+        }
+    }
+
+    lines.push(Line::from(""));
+    let mut option_spans = Vec::new();
+    for (i, choice) in PermissionChoice::ALL.iter().enumerate() {
+        if i > 0 {
+            option_spans.push(Span::raw("  "));
+        }
+        let style = if i == pending.selected {
+            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        option_spans.push(Span::styled(format!(" {} ", choice.label()), style));
+    }
+    lines.push(Line::from(option_spans));
+    lines.push(Line::from(Span::styled(
+        "left/right to choose, enter to confirm (y/n/a/d shortcuts)",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" permission requested ");
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup);
 }
 
 /// The sidebar is additive: with nothing to show yet (no plan, no child
@@ -150,9 +226,11 @@ fn wrapped_lines(text: &str, label: &str, style: Style) -> Vec<Line<'static>> {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let title = if app.pending_permission.is_some() {
-        " allow? [y/n] "
-    } else if !app.input_enabled() {
+    // The permission modal (drawn on top, see `draw`) is the actual UI for
+    // that decision now -- this just needs to read as "not your turn" the
+    // same way any other non-editable state does, not duplicate the modal's
+    // own prompt.
+    let title = if !app.input_enabled() {
         " waiting... "
     } else {
         " prompt (Enter to send, Alt+Enter for a new line) "
@@ -264,12 +342,55 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_permission_switches_the_input_box_title() {
+    fn a_pending_permission_switches_the_input_box_to_a_waiting_title() {
         let mut app = App::new();
         app.phase = ConnPhase::Ready;
-        app.pending_permission = Some(crate::app::PendingPermission { request_id: -1 });
+        app.pending_permission =
+            Some(crate::app::PendingPermission { request_id: -1, request: crate::app::fake_permission_request(), selected: 0 });
         let backend = render(&app);
-        assert!(buffer_contains(&backend, "allow? [y/n]"));
+        assert!(buffer_contains(&backend, "waiting..."), "the modal is the real UI now, input just reads not-your-turn");
+    }
+
+    #[test]
+    fn a_pending_permission_renders_a_modal_with_the_request_and_deny_highlighted_by_default() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.pending_permission =
+            Some(crate::app::PendingPermission { request_id: -1, request: crate::app::fake_permission_request(), selected: 0 });
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "permission requested"));
+        assert!(buffer_contains(&backend, "execute: echo hi"));
+        assert!(buffer_contains(&backend, "Allow"));
+        assert!(buffer_contains(&backend, "Always Allow"));
+        assert!(buffer_contains(&backend, "Always Deny"));
+    }
+
+    #[test]
+    fn a_permission_modal_shows_the_diff_summary_for_a_file_write() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        let mut request = crate::app::fake_permission_request();
+        request.action = lh_event::PermissionAction::FileWrite {
+            path: "src/main.rs".into(),
+            diff_summary: Some("-old line\n+new line".to_string()),
+        };
+        app.pending_permission = Some(crate::app::PendingPermission { request_id: -1, request, selected: 0 });
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "write src/main.rs"));
+        assert!(buffer_contains(&backend, "-old line"));
+        assert!(buffer_contains(&backend, "+new line"));
+    }
+
+    #[test]
+    fn a_permission_modal_with_no_diff_summary_shows_no_diff_lines() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        let mut request = crate::app::fake_permission_request();
+        request.action = lh_event::PermissionAction::FileWrite { path: "src/main.rs".into(), diff_summary: None };
+        app.pending_permission = Some(crate::app::PendingPermission { request_id: -1, request, selected: 0 });
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "write src/main.rs"));
+        assert!(!buffer_contains(&backend, "-old line"));
     }
 
     #[test]

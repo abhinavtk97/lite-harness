@@ -10,7 +10,7 @@ use lh_protocol::{
     SessionCreateResult, SessionPromptParams, SessionPromptResult, PROTOCOL_VERSION,
 };
 
-use crate::app::{App, ConnPhase, PendingKind, PendingPermission};
+use crate::app::{describe_permission_action, App, ConnPhase, PendingKind, PendingPermission, PermissionChoice};
 use crate::client::{ClientEvent, DaemonClient};
 
 /// Sends `initialize` and marks it pending -- the rest of the handshake
@@ -34,8 +34,11 @@ pub async fn handle_client_event(
     match event {
         ClientEvent::SessionEvent(event) => app.apply_session_event(&event),
         ClientEvent::PermissionAsk { request_id, request } => {
-            app.push_system(format!("permission requested: {request:?}"));
-            app.pending_permission = Some(PendingPermission { request_id });
+            // The modal (ui::draw_permission_modal) shows the full request
+            // while it's pending; this transcript line is just the lasting
+            // audit-trail record once the modal closes.
+            app.push_system(format!("permission requested: {}", describe_permission_action(&request.action)));
+            app.pending_permission = Some(PendingPermission { request_id, request, selected: 0 });
         }
         ClientEvent::Response(resp) => {
             // A ledger refresh is fire-and-forget from the input-gating
@@ -118,16 +121,29 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
     }
 
     if app.pending_permission.is_some() {
+        // Left/Right/Up/Down move the modal's highlight and Enter confirms
+        // whatever's currently highlighted (defaults to Deny -- see
+        // `PendingPermission`'s doc comment); y/n/a/d remain as direct
+        // shortcuts for anyone who'd rather not cycle through the options.
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some((id, decision)) = app.decide_pending_permission(true) {
-                    client.respond(id, serde_json::to_value(PermissionAskResult { decision })?).await?;
+            KeyCode::Left | KeyCode::Up => app.cycle_permission_selection(false),
+            KeyCode::Right | KeyCode::Down => app.cycle_permission_selection(true),
+            KeyCode::Enter => {
+                if let Some(choice) = app.selected_permission_choice() {
+                    respond_to_permission(app, client, choice.decision()).await?;
                 }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
-                if let Some((id, decision)) = app.decide_pending_permission(false) {
-                    client.respond(id, serde_json::to_value(PermissionAskResult { decision })?).await?;
-                }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                respond_to_permission(app, client, PermissionChoice::Allow.decision()).await?;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                respond_to_permission(app, client, PermissionChoice::Deny.decision()).await?;
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                respond_to_permission(app, client, PermissionChoice::AllowAlways.decision()).await?;
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                respond_to_permission(app, client, PermissionChoice::DenyAlways.decision()).await?;
             }
             _ => {}
         }
@@ -196,6 +212,21 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
     Ok(())
 }
 
+/// Answers whatever permission is currently pending (if anything still is
+/// -- a stray key event after it was already answered is a no-op) and
+/// clears it, matching the one-decision-per-request contract `permission/ask`
+/// expects.
+async fn respond_to_permission(
+    app: &mut App,
+    client: &mut DaemonClient,
+    decision: lh_event::PermissionDecision,
+) -> Result<()> {
+    if let Some((id, decision)) = app.decide_pending_permission(decision) {
+        client.respond(id, serde_json::to_value(PermissionAskResult { decision })?).await?;
+    }
+    Ok(())
+}
+
 const SCROLL_PAGE_LINES: u16 = 10;
 
 fn kind_label(kind: PendingKind) -> &'static str {
@@ -233,6 +264,22 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn a_permission_ask_event_defaults_the_modal_to_deny_and_logs_a_summary() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        let request = crate::app::fake_permission_request();
+
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::PermissionAsk { request_id: 7, request })
+            .await
+            .unwrap();
+
+        let pending = app.pending_permission.as_ref().expect("should now be pending");
+        assert_eq!(pending.request_id, 7);
+        assert_eq!(app.selected_permission_choice(), Some(crate::app::PermissionChoice::Deny));
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::System(t) if t.contains("execute: echo hi"))));
     }
 
     #[tokio::test]
@@ -299,11 +346,17 @@ mod tests {
         assert!(app.should_quit);
     }
 
+    fn pending_permission_app() -> App {
+        let mut app = App::new();
+        app.pending_permission =
+            Some(PendingPermission { request_id: -1, request: crate::app::fake_permission_request(), selected: 0 });
+        app
+    }
+
     #[tokio::test]
     async fn answering_a_pending_permission_with_n_denies_it() {
-        let mut app = App::new();
+        let mut app = pending_permission_app();
         let mut client = inert_client().await;
-        app.pending_permission = Some(PendingPermission { request_id: -1 });
 
         handle_key(&mut app, &mut client, key(KeyCode::Char('n'))).await.unwrap();
 
@@ -312,13 +365,60 @@ mod tests {
 
     #[tokio::test]
     async fn an_unrecognized_key_while_answering_a_permission_is_a_no_op() {
-        let mut app = App::new();
+        let mut app = pending_permission_app();
         let mut client = inert_client().await;
-        app.pending_permission = Some(PendingPermission { request_id: -1 });
 
-        handle_key(&mut app, &mut client, key(KeyCode::Left)).await.unwrap();
+        handle_key(&mut app, &mut client, key(KeyCode::Tab)).await.unwrap();
 
         assert!(app.pending_permission.is_some(), "an unrelated key must not answer the pending permission");
+    }
+
+    #[tokio::test]
+    async fn arrow_keys_cycle_the_permission_modals_selection_without_answering_it() {
+        let mut app = pending_permission_app();
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Right)).await.unwrap();
+
+        assert!(app.pending_permission.is_some(), "cycling must not answer the request");
+        assert_eq!(app.selected_permission_choice(), Some(crate::app::PermissionChoice::Allow));
+    }
+
+    #[tokio::test]
+    async fn enter_confirms_the_currently_selected_option_which_defaults_to_deny() {
+        let mut app = pending_permission_app();
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Enter)).await.unwrap();
+
+        assert!(app.pending_permission.is_none(), "must answer once confirmed, not just close the modal");
+    }
+
+    #[tokio::test]
+    async fn a_key_after_the_permission_is_already_answered_is_a_no_op() {
+        let mut app = pending_permission_app();
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Char('n'))).await.unwrap();
+        assert!(app.pending_permission.is_none());
+
+        // A second key event (e.g. a stray repeat) after the modal already
+        // closed must not panic or try to answer a nonexistent request.
+        handle_key(&mut app, &mut client, key(KeyCode::Char('y'))).await.unwrap();
+        assert!(app.pending_permission.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_and_d_answer_with_the_always_scoped_decisions() {
+        let mut app = pending_permission_app();
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Char('a'))).await.unwrap();
+        assert!(app.pending_permission.is_none());
+
+        app = pending_permission_app();
+        handle_key(&mut app, &mut client, key(KeyCode::Char('d'))).await.unwrap();
+        assert!(app.pending_permission.is_none());
     }
 
     #[tokio::test]
