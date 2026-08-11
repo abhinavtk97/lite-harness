@@ -315,6 +315,192 @@ mod tests {
         assert_eq!(uses[0].1, "read_file");
     }
 
+    #[test]
+    fn describe_reports_tool_calling_and_usage_but_no_streaming() {
+        let provider =
+            AnthropicProtocolProvider::new("http://localhost", "test-key", "claude-test", HashMap::new());
+        let caps = provider.describe();
+        assert!(caps.tool_calling);
+        assert!(!caps.streaming);
+        assert!(caps.reports_usage);
+    }
+
+    #[tokio::test]
+    async fn sends_extra_headers_on_every_request() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-org-id", "org-42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut extra_headers = HashMap::new();
+        extra_headers.insert("x-org-id".to_string(), "org-42".to_string());
+        let provider =
+            AnthropicProtocolProvider::new(server.uri(), "test-key", "claude-test", extra_headers);
+
+        let resp = provider
+            .complete(ModelRequest {
+                model: "claude-test".to_string(),
+                system: None,
+                messages: vec![ChatMessage::user_text("hi")],
+                tools: vec![],
+                max_tokens: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.text(), "ok");
+    }
+
+    #[tokio::test]
+    async fn maps_stop_sequence_finish_reason_to_end_turn() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "stopped early"}],
+                "stop_reason": "stop_sequence",
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            AnthropicProtocolProvider::new(server.uri(), "test-key", "claude-test", HashMap::new());
+
+        let resp = provider
+            .complete(ModelRequest {
+                model: "claude-test".to_string(),
+                system: None,
+                messages: vec![ChatMessage::user_text("hi")],
+                tools: vec![],
+                max_tokens: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.stop_reason, StopReason::EndTurn);
+    }
+
+    #[tokio::test]
+    async fn maps_max_tokens_finish_reason_to_max_tokens_stop_reason() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "truncated"}],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            AnthropicProtocolProvider::new(server.uri(), "test-key", "claude-test", HashMap::new());
+
+        let resp = provider
+            .complete(ModelRequest {
+                model: "claude-test".to_string(),
+                system: None,
+                messages: vec![ChatMessage::user_text("hi")],
+                tools: vec![],
+                max_tokens: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.stop_reason, StopReason::MaxTokens);
+    }
+
+    #[tokio::test]
+    async fn maps_an_unrecognized_stop_reason_and_unknown_content_blocks_to_other_and_filters_them() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "partial"},
+                    {"type": "thinking", "thinking": "hmm"}
+                ],
+                "stop_reason": "pause_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            AnthropicProtocolProvider::new(server.uri(), "test-key", "claude-test", HashMap::new());
+
+        let resp = provider
+            .complete(ModelRequest {
+                model: "claude-test".to_string(),
+                system: None,
+                messages: vec![ChatMessage::user_text("hi")],
+                tools: vec![],
+                max_tokens: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.stop_reason, StopReason::Other);
+        assert_eq!(resp.text(), "partial");
+        assert_eq!(resp.content.len(), 1, "the unknown 'thinking' block should be filtered out");
+    }
+
+    #[test]
+    fn to_wire_request_serializes_assistant_tool_use_and_tool_result_content_blocks() {
+        let req = ModelRequest {
+            model: "claude-test".to_string(),
+            system: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: vec![ChatContent::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "a.txt"}),
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: vec![ChatContent::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: "file contents".to_string(),
+                        is_error: true,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 100,
+        };
+
+        let wire = to_wire_request(&req, "claude-test");
+        assert_eq!(wire.messages.len(), 2);
+        assert_eq!(wire.messages[0].role, "assistant");
+        let tool_use_json = serde_json::to_value(&wire.messages[0].content[0]).unwrap();
+        assert_eq!(tool_use_json["type"], "tool_use");
+        assert_eq!(tool_use_json["id"], "call_1");
+        assert_eq!(tool_use_json["name"], "read_file");
+        assert_eq!(tool_use_json["input"]["path"], "a.txt");
+
+        assert_eq!(wire.messages[1].role, "user");
+        let tool_result_json = serde_json::to_value(&wire.messages[1].content[0]).unwrap();
+        assert_eq!(tool_result_json["type"], "tool_result");
+        assert_eq!(tool_result_json["tool_use_id"], "call_1");
+        assert_eq!(tool_result_json["content"], "file contents");
+        assert_eq!(tool_result_json["is_error"], true);
+    }
+
     #[tokio::test]
     async fn surfaces_non_2xx_responses_as_api_errors() {
         let server = MockServer::start().await;
