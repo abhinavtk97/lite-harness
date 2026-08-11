@@ -13,6 +13,7 @@ lh-ledger = { path = "../lh-ledger" }
 lh-protocol = { path = "../lh-protocol" }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+pulldown-cmark = "0.13"
 tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

@@ -11,5 +11,6 @@ pub mod app;
 pub mod client;
 pub mod dispatch;
 pub mod input;
+pub mod markdown;
 pub mod mouse;
 pub mod ui;

@@ -249,9 +249,13 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
 
 fn transcript_lines(item: &TranscriptItem) -> Vec<Line<'static>> {
     match item {
+        // The user's own typed text is rendered literally, not parsed as
+        // Markdown -- it's plain intent, not authored/formatted content,
+        // and re-flowing exactly what someone just typed would surprise
+        // them more than it'd help.
         TranscriptItem::User(text) => wrapped_lines(text, "you", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        TranscriptItem::Agent(text) => wrapped_lines(text, "", Style::default()),
-        TranscriptItem::Thought(text) => wrapped_lines(text, "thinking", Style::default().fg(Color::DarkGray)),
+        TranscriptItem::Agent(text) => markdown_lines(text, "", Style::default()),
+        TranscriptItem::Thought(text) => markdown_lines(text, "thinking", Style::default().fg(Color::DarkGray)),
         TranscriptItem::ToolCall { tool_name, source } => {
             vec![Line::from(Span::styled(
                 format!("  -> {tool_name} [{source}]"),
@@ -278,6 +282,21 @@ fn transcript_lines(item: &TranscriptItem) -> Vec<Line<'static>> {
 fn wrapped_lines(text: &str, label: &str, style: Style) -> Vec<Line<'static>> {
     let prefix = if label.is_empty() { String::new() } else { format!("{label}: ") };
     vec![Line::from(Span::styled(format!("{prefix}{text}"), style))]
+}
+
+/// Renders `text` as Markdown (see `markdown::render`) and prepends `label`
+/// (if any) as its own bold span on the first line only -- everything
+/// after that first line is the message's own content, unprefixed, same
+/// as how a chat UI's "who's speaking" label only ever appears once per
+/// message, not once per line.
+fn markdown_lines(text: &str, label: &str, base_style: Style) -> Vec<Line<'static>> {
+    let mut lines = crate::markdown::render(text, base_style);
+    if !label.is_empty() {
+        if let Some(first) = lines.first_mut() {
+            first.spans.insert(0, Span::styled(format!("{label}: "), base_style.add_modifier(Modifier::BOLD)));
+        }
+    }
+    lines
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
@@ -369,6 +388,25 @@ mod tests {
         app.push_user_message("hello there".to_string());
         let backend = render(&app);
         assert!(buffer_contains(&backend, "you: hello there"));
+    }
+
+    #[test]
+    fn an_agent_message_renders_its_markdown_formatting_not_literal_syntax_characters() {
+        let mut app = App::new();
+        app.transcript.push(TranscriptItem::Agent("# Heading\n\nsome **bold** text".to_string()));
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "Heading"));
+        assert!(buffer_contains(&backend, "bold"));
+        assert!(!buffer_contains(&backend, "**bold**"), "the ** markers should be styling, not literal characters");
+        assert!(!buffer_contains(&backend, "# Heading"), "the # marker should be styling, not a literal character");
+    }
+
+    #[test]
+    fn a_thought_message_still_carries_its_thinking_label_alongside_markdown_rendering() {
+        let mut app = App::new();
+        app.transcript.push(TranscriptItem::Thought("plain thought".to_string()));
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "thinking: plain thought"));
     }
 
     #[test]
