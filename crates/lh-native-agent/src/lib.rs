@@ -24,6 +24,7 @@
 
 mod tools;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,11 +35,20 @@ use lh_event::{
     PermissionDecision, PermissionRequest, SessionDriver, SessionId, ToolCall, ToolCallStatus,
     ToolSource, UsageConfidence, UsageDelta,
 };
-use lh_execution::ExecutionPlane;
+use lh_execution::{BackgroundProcess, ExecutionPlane};
 use lh_model_provider::{ChatContent, ChatMessage, ChatRole, ModelProvider, ModelRequest, ToolSpec};
 use lh_orchestration::{ChildRunner, TaskHandoff};
 use lh_permission::{DefaultPermissionEngine, PermissionEngine, PermissionPrompter};
 use lh_store::SessionStore;
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Shared, per-connection registry of live background processes, keyed by
+/// the id minted for them -- owned by whoever constructs `NativeAgentLoop`
+/// instances across multiple turns (the daemon), not by the loop itself,
+/// since a `session/prompt` call builds a fresh `NativeAgentLoop` every
+/// turn but a background task started in one turn must still be pollable
+/// in the next (matching Claude Code's own BashOutput UX).
+pub type BackgroundProcessRegistry = Arc<AsyncMutex<HashMap<String, Arc<dyn BackgroundProcess>>>>;
 
 pub use tools::builtin_tool_specs;
 
@@ -161,6 +171,12 @@ pub struct NativeAgentLoop {
     /// project/global policy stores, so it structurally cannot read or
     /// write rules at those scopes, not just by runtime convention.
     prompter: Arc<dyn PermissionPrompter>,
+    /// Cross-turn background-process state -- see `BackgroundProcessRegistry`.
+    /// A subagent gets its own fresh, empty registry (`run_subagent_outcome`),
+    /// never the parent's: background tasks don't leak across the same
+    /// context-isolation boundary the child's permission engine already
+    /// enforces.
+    background_processes: BackgroundProcessRegistry,
     config: AgentConfig,
 }
 
@@ -172,6 +188,7 @@ impl NativeAgentLoop {
         execution_plane: Arc<dyn ExecutionPlane>,
         pricing: Arc<lh_ledger::PricingTable>,
         prompter: Arc<dyn PermissionPrompter>,
+        background_processes: BackgroundProcessRegistry,
         config: AgentConfig,
     ) -> Self {
         Self {
@@ -181,6 +198,7 @@ impl NativeAgentLoop {
             execution_plane,
             pricing,
             prompter,
+            background_processes,
             config,
         }
     }
@@ -326,6 +344,28 @@ impl NativeAgentLoop {
         )
         .await?;
 
+        // bash_output/bash_kill act on a background process that a prior,
+        // permission-gated bash_background call already started -- no new
+        // risk to ask about, so (mirroring the identical design decision
+        // for ACP's terminal/output|wait_for_exit|kill in lh-acp) they skip
+        // the live ask entirely, going straight to their own ToolCallUpdated
+        // for audit visibility instead of the usual PermissionRequested/
+        // PermissionDecided pair.
+        if tool_name == "bash_output" || tool_name == "bash_kill" {
+            let (status, output, is_error) = self.query_background_process(tool_name, input).await;
+            self.emit(
+                session_id,
+                Actor::System,
+                EventPayload::ToolCallUpdated {
+                    call_id: call_id.to_string(),
+                    status,
+                    output: Some(ContentBlock::text(output.clone())),
+                },
+            )
+            .await?;
+            return Ok((output, is_error));
+        }
+
         let request = PermissionRequest {
             session_id,
             tool_source: source,
@@ -369,6 +409,15 @@ impl NativeAgentLoop {
                             true,
                         ),
                     }
+                } else if tool_name == "bash_background" {
+                    match self.execution_plane.spawn_background(&call, &decision).await {
+                        Ok(process) => {
+                            let bash_id = lh_event::EventId::now_v7().to_string();
+                            self.background_processes.lock().await.insert(bash_id.clone(), process);
+                            (ToolCallStatus::Completed, bash_id, false)
+                        }
+                        Err(e) => (ToolCallStatus::Failed, e.to_string(), true),
+                    }
                 } else {
                     match self.execution_plane.execute(&call, &decision).await {
                         Ok(out) => (ToolCallStatus::Completed, out, false),
@@ -393,6 +442,39 @@ impl NativeAgentLoop {
         .await?;
 
         Ok((output, is_error))
+    }
+
+    /// `bash_output`/`bash_kill`'s actual logic -- looked up by the id
+    /// `bash_background` minted and stored in `self.background_processes`.
+    async fn query_background_process(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> (ToolCallStatus, String, bool) {
+        let Some(bash_id) = input.get("bash_id").and_then(|v| v.as_str()) else {
+            return (ToolCallStatus::Failed, format!("{tool_name} requires 'bash_id'"), true);
+        };
+        let Some(process) = self.background_processes.lock().await.get(bash_id).cloned() else {
+            return (ToolCallStatus::Failed, format!("unknown bash_id: {bash_id}"), true);
+        };
+        match tool_name {
+            "bash_output" => {
+                let out = process.output().await;
+                let mut text = out.text;
+                match out.exit_status {
+                    Some(status) => {
+                        text.push_str(&format!("\n[exited: code={:?} signal={:?}]", status.code, status.signal));
+                    }
+                    None => text.push_str("\n[still running]"),
+                }
+                (ToolCallStatus::Completed, text, false)
+            }
+            "bash_kill" => {
+                process.kill().await;
+                (ToolCallStatus::Completed, format!("killed {bash_id}"), false)
+            }
+            _ => unreachable!("query_background_process is only called for bash_output/bash_kill"),
+        }
     }
 
     /// Thin wrapper around `run_subagent_outcome` (the `ChildRunner::run`
@@ -498,6 +580,10 @@ impl NativeAgentLoop {
             self.execution_plane.clone(),
             self.pricing.clone(),
             self.prompter.clone(),
+            // Fresh, empty registry -- a subagent's background tasks don't
+            // leak across the same context-isolation boundary its
+            // session-scoped-only permission engine already enforces.
+            Arc::new(AsyncMutex::new(HashMap::new())),
             child_config,
         );
 
@@ -738,6 +824,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -774,6 +861,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -834,6 +922,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -902,6 +991,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -949,6 +1039,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1003,6 +1094,7 @@ mod tests {
             local_plane(workspace.path()).await,
             Arc::new(lh_ledger::PricingTable::new()),
             prompter,
+            Arc::new(AsyncMutex::new(HashMap::new())),
             AgentConfig {
                 model: "test-model".to_string(),
                 workspace_root: workspace.path().to_path_buf(),
@@ -1065,6 +1157,132 @@ mod tests {
         assert_eq!(tree.children.len(), 1);
         assert_eq!(tree.children[0].session_id, child_session_id);
         assert!(matches!(tree.children[0].driver, Some(SessionDriver::Native)));
+    }
+
+    #[tokio::test]
+    async fn bash_background_start_poll_and_kill_round_trip() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let provider = Arc::new(ScriptedModelProvider::new(vec![]));
+        let engine = Arc::new(FixedDecisionEngine(PermissionDecision::Allow));
+        let prompter = Arc::new(FixedPrompter(PermissionDecision::Allow));
+        let session_id = SessionId::now_v7();
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+
+        let agent = NativeAgentLoop::new(
+            store.clone(),
+            provider,
+            engine,
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            prompter,
+            registry.clone(),
+            AgentConfig {
+                model: "test-model".to_string(),
+                workspace_root: workspace.path().to_path_buf(),
+                ..Default::default()
+            },
+        );
+
+        let (bash_id, is_error) = agent
+            .handle_one_tool_call(
+                session_id,
+                "call_1",
+                "bash_background",
+                &serde_json::json!({"command": "echo start; sleep 0.3; echo done"}),
+            )
+            .await
+            .unwrap();
+        assert!(!is_error);
+        assert_eq!(registry.lock().await.len(), 1, "the registry must hold the process the tool call started");
+
+        // Polled immediately -- the command sleeps 0.3s, so this must
+        // reflect "still running," not block waiting for it.
+        let (early, is_error) = agent
+            .handle_one_tool_call(session_id, "call_2", "bash_output", &serde_json::json!({"bash_id": bash_id}))
+            .await
+            .unwrap();
+        assert!(!is_error);
+        assert!(early.contains("still running"), "got: {early}");
+
+        let (long_id, _) = agent
+            .handle_one_tool_call(session_id, "call_3", "bash_background", &serde_json::json!({"command": "sleep 30"}))
+            .await
+            .unwrap();
+        let (kill_out, is_error) = agent
+            .handle_one_tool_call(session_id, "call_4", "bash_kill", &serde_json::json!({"bash_id": long_id}))
+            .await
+            .unwrap();
+        assert!(!is_error);
+        assert!(kill_out.contains("killed"), "got: {kill_out}");
+
+        let (err_out, is_error) = agent
+            .handle_one_tool_call(session_id, "call_5", "bash_output", &serde_json::json!({"bash_id": "nope"}))
+            .await
+            .unwrap();
+        assert!(is_error);
+        assert!(err_out.contains("unknown bash_id"), "got: {err_out}");
+
+        // Only the two bash_background calls should have gone through a
+        // fresh permission ask -- bash_output/bash_kill deliberately skip it.
+        let events = store.read_from(session_id, 0).await.unwrap();
+        let permission_asks =
+            events.iter().filter(|e| matches!(e.payload, EventPayload::PermissionRequested { .. })).count();
+        assert_eq!(permission_asks, 2);
+    }
+
+    #[tokio::test]
+    async fn background_processes_persist_across_separate_native_agent_loop_instances() {
+        // Matches how the daemon actually uses this: a fresh NativeAgentLoop
+        // is constructed per session/prompt call, but the registry Arc is
+        // shared across the whole connection -- a background task started
+        // in "turn 1" must still be pollable from "turn 2"'s instance.
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let session_id = SessionId::now_v7();
+        let registry: BackgroundProcessRegistry = Arc::new(AsyncMutex::new(HashMap::new()));
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            workspace_root: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let turn1 = NativeAgentLoop::new(
+            store.clone(),
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            registry.clone(),
+            config.clone(),
+        );
+        let (bash_id, _) = turn1
+            .handle_one_tool_call(
+                session_id,
+                "call_1",
+                "bash_background",
+                &serde_json::json!({"command": "echo hi; sleep 0.2; echo bye"}),
+            )
+            .await
+            .unwrap();
+
+        let turn2 = NativeAgentLoop::new(
+            store.clone(),
+            Arc::new(ScriptedModelProvider::new(vec![])),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            registry.clone(),
+            config,
+        );
+        let (output, is_error) = turn2
+            .handle_one_tool_call(session_id, "call_2", "bash_output", &serde_json::json!({"bash_id": bash_id}))
+            .await
+            .unwrap();
+        assert!(!is_error, "a fresh NativeAgentLoop sharing the registry must still see the process turn1 started");
+        assert!(output.contains("hi") || output.contains("still running"), "got: {output}");
     }
 
     fn payload_kind(event: &Event) -> &'static str {

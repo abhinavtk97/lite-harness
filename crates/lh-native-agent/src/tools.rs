@@ -47,6 +47,39 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "bash_background".to_string(),
+            description: "Start a shell command running in the background and return a bash_id \
+                immediately, without waiting for it to finish. Use bash_output to check on it \
+                later (safe to call repeatedly while it's still running) and bash_kill to stop it."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "required": ["command"]
+            }),
+        },
+        ToolSpec {
+            name: "bash_output".to_string(),
+            description: "Check the output and exit status of a command started with \
+                bash_background, given its bash_id."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "bash_id": { "type": "string" } },
+                "required": ["bash_id"]
+            }),
+        },
+        ToolSpec {
+            name: "bash_kill".to_string(),
+            description: "Stop a command started with bash_background, given its bash_id."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "bash_id": { "type": "string" } },
+                "required": ["bash_id"]
+            }),
+        },
+        ToolSpec {
             name: "spawn_subagent".to_string(),
             description: "Delegate a focused sub-task to a fresh native subagent with its own \
                 conversation (it does not see this conversation's history, only the instructions \
@@ -71,6 +104,14 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
+/// `bash_output`/`bash_kill` deliberately have no arms here -- unlike
+/// every other tool, `NativeAgentLoop::handle_one_tool_call` intercepts
+/// them *before* this function is ever called, skipping a fresh live
+/// permission ask entirely (mirrors the identical design decision already
+/// made for ACP's `terminal/output`/`terminal/wait_for_exit`/`terminal/kill`
+/// in `lh-acp`: reading or killing an already-approved background process
+/// -- started by a permission-gated `bash_background` call -- creates no
+/// new risk to ask about again).
 pub fn permission_action_for(tool_name: &str, input: &serde_json::Value) -> PermissionAction {
     match tool_name {
         "read_file" => PermissionAction::FileRead {
@@ -80,7 +121,7 @@ pub fn permission_action_for(tool_name: &str, input: &serde_json::Value) -> Perm
             path: PathBuf::from(str_arg(input, "path").unwrap_or_default()),
             diff_summary: None,
         },
-        "bash" => PermissionAction::Exec {
+        "bash" | "bash_background" => PermissionAction::Exec {
             command: str_arg(input, "command").unwrap_or_default().to_string(),
             args: vec![],
             cwd: PathBuf::from("."),
@@ -101,7 +142,7 @@ pub fn risk_tier_for(tool_name: &str) -> RiskTier {
     match tool_name {
         "read_file" => RiskTier::Read,
         "write_file" => RiskTier::Write,
-        "bash" => RiskTier::Execute,
+        "bash" | "bash_background" => RiskTier::Execute,
         "spawn_subagent" => RiskTier::Execute,
         _ => RiskTier::Execute,
     }
@@ -129,7 +170,14 @@ mod tests {
         assert_eq!(risk_tier_for("read_file"), RiskTier::Read);
         assert_eq!(risk_tier_for("write_file"), RiskTier::Write);
         assert_eq!(risk_tier_for("bash"), RiskTier::Execute);
+        assert_eq!(risk_tier_for("bash_background"), RiskTier::Execute);
         assert_eq!(risk_tier_for("spawn_subagent"), RiskTier::Execute);
+    }
+
+    #[test]
+    fn bash_background_gets_the_same_exec_action_shape_as_bash() {
+        let action = permission_action_for("bash_background", &serde_json::json!({"command": "sleep 5"}));
+        assert!(matches!(action, PermissionAction::Exec { command, .. } if command == "sleep 5"));
     }
 
     #[test]

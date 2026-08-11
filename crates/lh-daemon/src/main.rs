@@ -306,6 +306,13 @@ async fn handle_connection(
         global_policy,
     ));
     let workspace_root = PathBuf::from(&params.cwd);
+    // One registry per connection, not per session/prompt call: a
+    // NativeAgentLoop is constructed fresh for every session/prompt, but a
+    // background task started in one turn (bash_background) must still be
+    // pollable (bash_output/bash_kill) from a later turn on the same
+    // session -- matching Claude Code's own BashOutput UX.
+    let background_processes: lh_native_agent::BackgroundProcessRegistry =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // 4. steady state: session/prompt and permission/respond, interleaved.
     loop {
@@ -323,6 +330,7 @@ async fn handle_connection(
                             &execution_plane,
                             &pricing,
                             &shared_prompter,
+                            &background_processes,
                             &write_half,
                             forwarded_seq.clone(),
                         )
@@ -398,6 +406,7 @@ async fn handle_session_prompt(
     execution_plane: &Arc<dyn ExecutionPlane>,
     pricing: &Arc<PricingTable>,
     prompter: &Arc<dyn lh_permission::PermissionPrompter>,
+    background_processes: &lh_native_agent::BackgroundProcessRegistry,
     write_half: &SharedWriter,
     forwarded_seq: tokio::sync::watch::Receiver<Option<u64>>,
 ) -> Result<()> {
@@ -415,6 +424,7 @@ async fn handle_session_prompt(
         execution_plane.clone(),
         pricing.clone(),
         prompter.clone(),
+        background_processes.clone(),
         AgentConfig {
             provider_name: name.clone(),
             model: model.clone(),
