@@ -6,6 +6,7 @@
 //! *identical* `PermissionEngine` instance the native loop uses -- no
 //! parallel trust boundary (§6).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use lh_event::{
     Actor, AgentKind, ContentBlock, Event, EventPayload, PermissionAction, PermissionDecision,
     PermissionRequest, RiskTier, SessionId, ToolCall, ToolCallStatus, ToolSource,
 };
-use lh_execution::ExecutionPlane;
+use lh_execution::{BackgroundProcess, ExecutionPlane};
 use lh_permission::PermissionEngine;
 use lh_store::SessionStore;
 use tokio::sync::Mutex as AsyncMutex;
@@ -33,6 +34,10 @@ pub struct HarnessAcpClient {
     /// per-turn delta; `delegate::run_delegation` diffs successive
     /// snapshots of this into a per-turn `UsageDelta`).
     last_reported_cost: AsyncMutex<Option<f64>>,
+    /// Live background processes created via `terminal/create`, keyed by
+    /// the id we minted for them. `terminal/output`/`wait_for_exit`/`kill`
+    /// all just look a handle up here; `terminal/release` removes it.
+    terminals: AsyncMutex<HashMap<String, Arc<dyn BackgroundProcess>>>,
 }
 
 impl HarnessAcpClient {
@@ -52,6 +57,7 @@ impl HarnessAcpClient {
             execution_plane,
             workspace_root,
             last_reported_cost: AsyncMutex::new(None),
+            terminals: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -175,6 +181,157 @@ impl HarnessAcpClient {
             }
         }
     }
+
+    /// `terminal/create` (architecture §12.2's neighbor concern -- ACP's
+    /// own background-task capability): gated through the identical
+    /// `PermissionEngine` and audited with the same `PermissionRequested`/
+    /// `PermissionDecided`/`ToolCallRequested` events a native tool call
+    /// gets, then handed to `ExecutionPlane::spawn_background` -- the same
+    /// sandboxed command construction `execute()`'s `bash` arm uses,
+    /// just non-blocking. `command`/`args` are joined into one
+    /// POSIX-quoted shell word each (never string-concatenated
+    /// unescaped) since `ExecutionPlane` only takes a shell command
+    /// string today, matching the native `bash` tool's own shape.
+    pub async fn handle_terminal_create(
+        &self,
+        req: acp::CreateTerminalRequest,
+    ) -> Result<acp::CreateTerminalResponse> {
+        let cwd = req.cwd.clone().unwrap_or_else(|| self.workspace_root.clone());
+        let shell_command = shell_quote_command(&req.command, &req.args);
+
+        let perm_request = PermissionRequest {
+            session_id: self.child_session_id,
+            tool_source: ToolSource::Acp { agent: self.agent_kind.clone() },
+            action: PermissionAction::Exec { command: req.command.clone(), args: req.args.clone(), cwd },
+            risk_tier: RiskTier::Execute,
+        };
+        let terminal_id = lh_event::EventId::now_v7().to_string();
+
+        self.emit(
+            Actor::System,
+            EventPayload::PermissionRequested { call_id: terminal_id.clone(), request: perm_request.clone() },
+        )
+        .await?;
+        let resolution = self.permission_engine.decide(&perm_request).await?;
+        self.emit(
+            Actor::System,
+            EventPayload::PermissionDecided {
+                call_id: terminal_id.clone(),
+                decision: resolution.decision.clone(),
+                decided_by: resolution.source,
+            },
+        )
+        .await?;
+
+        if let PermissionDecision::Deny | PermissionDecision::DenyAlways { .. } = &resolution.decision {
+            anyhow::bail!("terminal/create denied by permission policy")
+        }
+
+        let call = ToolCall {
+            call_id: terminal_id.clone(),
+            tool_name: "terminal".to_string(),
+            source: ToolSource::Acp { agent: self.agent_kind.clone() },
+            args_summary: serde_json::json!({ "command": req.command, "args": req.args }),
+            raw_args: serde_json::json!({ "command": shell_command }),
+        };
+        self.emit(Actor::Agent, EventPayload::ToolCallRequested { call: call.clone() }).await?;
+
+        let process = self.execution_plane.spawn_background(&call, &resolution.decision).await?;
+        self.terminals.lock().await.insert(terminal_id.clone(), process);
+
+        Ok(acp::CreateTerminalResponse::new(terminal_id))
+    }
+
+    pub async fn handle_terminal_output(
+        &self,
+        req: acp::TerminalOutputRequest,
+    ) -> Result<acp::TerminalOutputResponse> {
+        let process = self.terminal_handle(&req.terminal_id).await?;
+        let out = process.output().await;
+        let mut resp = acp::TerminalOutputResponse::new(out.text, out.truncated);
+        if let Some(status) = out.exit_status {
+            resp = resp.exit_status(Some(translate_exit_status(status)));
+        }
+        Ok(resp)
+    }
+
+    pub async fn handle_wait_for_terminal_exit(
+        &self,
+        req: acp::WaitForTerminalExitRequest,
+    ) -> Result<acp::WaitForTerminalExitResponse> {
+        let process = self.terminal_handle(&req.terminal_id).await?;
+        let status = process.wait_for_exit().await;
+        Ok(acp::WaitForTerminalExitResponse::new(translate_exit_status(status)))
+    }
+
+    pub async fn handle_kill_terminal(&self, req: acp::KillTerminalRequest) -> Result<acp::KillTerminalResponse> {
+        let process = self.terminal_handle(&req.terminal_id).await?;
+        process.kill().await;
+        Ok(acp::KillTerminalResponse::new())
+    }
+
+    /// "The Agent MUST release the terminal using `terminal/release` when
+    /// it's no longer needed" -- the spec's own words for this method, and
+    /// in practice the one call in the lifecycle guaranteed to happen, so
+    /// it's where a final `ToolCallUpdated` gets recorded for the audit
+    /// trail. Kills defensively first (a no-op if already exited) so a
+    /// released-while-still-running process doesn't outlive the terminal
+    /// that was tracking it, matching "release... terminates any running
+    /// process" from the spec.
+    pub async fn handle_terminal_release(
+        &self,
+        req: acp::ReleaseTerminalRequest,
+    ) -> Result<acp::ReleaseTerminalResponse> {
+        let terminal_id = req.terminal_id.0.to_string();
+        if let Some(process) = self.terminals.lock().await.remove(&terminal_id) {
+            process.kill().await;
+            let out = process.output().await;
+            let status = if out.exit_status.is_some() { ToolCallStatus::Completed } else { ToolCallStatus::Cancelled };
+            self.emit(
+                Actor::System,
+                EventPayload::ToolCallUpdated {
+                    call_id: terminal_id,
+                    status,
+                    output: Some(ContentBlock::text(out.text)),
+                },
+            )
+            .await?;
+        }
+        Ok(acp::ReleaseTerminalResponse::new())
+    }
+
+    async fn terminal_handle(&self, terminal_id: &acp::TerminalId) -> Result<Arc<dyn BackgroundProcess>> {
+        self.terminals
+            .lock()
+            .await
+            .get(terminal_id.0.as_ref())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unknown or already-released terminal id: {}", terminal_id.0))
+    }
+}
+
+/// Wraps `command` and each of `args` in single quotes (escaping any
+/// embedded single quote as `'\''`, the standard POSIX-safe way to turn an
+/// arbitrary string into one shell word without a shell parsing it first)
+/// and joins them with spaces. `ExecutionPlane` only takes a shell command
+/// string today (matching the native `bash` tool); ACP's `command`/`args`
+/// are execve-style (never shell-interpreted), so this reproduces that
+/// exact semantics through a shell layer instead of letting agent- or
+/// attacker-controlled argument text reach the shell parser unescaped.
+fn shell_quote_command(command: &str, args: &[String]) -> String {
+    let mut words = vec![shell_quote(command)];
+    words.extend(args.iter().map(|a| shell_quote(a)));
+    words.join(" ")
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+fn translate_exit_status(status: lh_execution::ExitStatus) -> acp::TerminalExitStatus {
+    acp::TerminalExitStatus::new()
+        .exit_code(status.code.map(|c| c as u32))
+        .signal(status.signal)
 }
 
 /// ACP paths are absolute (`session/new`'s `cwd` contract); our native

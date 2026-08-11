@@ -176,8 +176,9 @@ impl AcpConnection {
 /// Responses back to whichever `call()` is waiting on that id, dispatches
 /// Notifications (`session/update`) to `client`, and answers Requests the
 /// agent sends us (`session/request_permission`, `fs/read_text_file`,
-/// `fs/write_text_file`) by calling into `client` and writing a Response
-/// back -- the bidirectional trifecta this connection exists for.
+/// `fs/write_text_file`, `terminal/*`) by calling into `client` and
+/// writing a Response back -- the bidirectional trifecta this connection
+/// exists for.
 fn spawn_read_loop(
     stdout: ChildStdout,
     pending: Arc<Mutex<HashMap<AcpRequestId, oneshot::Sender<std::result::Result<serde_json::Value, AcpError>>>>>,
@@ -263,6 +264,51 @@ async fn handle_incoming_request(
                 serde_json::from_value(params).map_err(|e| AcpError::invalid_params().data(e.to_string()))?;
             let resp = client
                 .handle_write_text_file(req)
+                .await
+                .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
+            serde_json::to_value(resp).map_err(|e| AcpError::internal_error().data(e.to_string()))
+        }
+        "terminal/create" => {
+            let req: acp::CreateTerminalRequest =
+                serde_json::from_value(params).map_err(|e| AcpError::invalid_params().data(e.to_string()))?;
+            let resp = client
+                .handle_terminal_create(req)
+                .await
+                .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
+            serde_json::to_value(resp).map_err(|e| AcpError::internal_error().data(e.to_string()))
+        }
+        "terminal/output" => {
+            let req: acp::TerminalOutputRequest =
+                serde_json::from_value(params).map_err(|e| AcpError::invalid_params().data(e.to_string()))?;
+            let resp = client
+                .handle_terminal_output(req)
+                .await
+                .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
+            serde_json::to_value(resp).map_err(|e| AcpError::internal_error().data(e.to_string()))
+        }
+        "terminal/wait_for_exit" => {
+            let req: acp::WaitForTerminalExitRequest =
+                serde_json::from_value(params).map_err(|e| AcpError::invalid_params().data(e.to_string()))?;
+            let resp = client
+                .handle_wait_for_terminal_exit(req)
+                .await
+                .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
+            serde_json::to_value(resp).map_err(|e| AcpError::internal_error().data(e.to_string()))
+        }
+        "terminal/kill" => {
+            let req: acp::KillTerminalRequest =
+                serde_json::from_value(params).map_err(|e| AcpError::invalid_params().data(e.to_string()))?;
+            let resp = client
+                .handle_kill_terminal(req)
+                .await
+                .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
+            serde_json::to_value(resp).map_err(|e| AcpError::internal_error().data(e.to_string()))
+        }
+        "terminal/release" => {
+            let req: acp::ReleaseTerminalRequest =
+                serde_json::from_value(params).map_err(|e| AcpError::invalid_params().data(e.to_string()))?;
+            let resp = client
+                .handle_terminal_release(req)
                 .await
                 .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
             serde_json::to_value(resp).map_err(|e| AcpError::internal_error().data(e.to_string()))

@@ -185,9 +185,19 @@ async fn run_delegation_inner(
 
     let mut conn = AcpConnection::spawn(adapter, workspace_root, client.clone()).await?;
 
-    let init_params = serde_json::to_value(acp::InitializeRequest::new(
-        agent_client_protocol_schema::ProtocolVersion::V1,
-    ))?;
+    // Client capabilities default to all-false (confirmed against the
+    // schema crate's own `ClientCapabilities::default()`) -- omitting
+    // this declaration would mean a spec-compliant agent never calls our
+    // fs/read_text_file, fs/write_text_file, or terminal/* handlers at
+    // all, even though `HarnessAcpClient` implements every one of them.
+    let init_params = serde_json::to_value(
+        acp::InitializeRequest::new(agent_client_protocol_schema::ProtocolVersion::V1)
+            .client_capabilities(
+                acp::ClientCapabilities::new()
+                    .fs(acp::FileSystemCapabilities::new().read_text_file(true).write_text_file(true))
+                    .terminal(true),
+            ),
+    )?;
     let _init: acp::InitializeResponse = conn.call("initialize", init_params).await?;
 
     let new_session_params = serde_json::to_value(acp::NewSessionRequest::new(workspace_root))?;

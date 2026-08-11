@@ -13,8 +13,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lh_acp::registry::{DelegatedAgentAdapter, SpawnSpec};
 use lh_event::{
-    AgentKind, ChildOutcome, EventPayload, PermissionDecision, PermissionRequest, SessionId,
-    UsageConfidence,
+    AgentKind, ChildOutcome, ContentBlock, EventPayload, PermissionDecision, PermissionRequest,
+    SessionId, UsageConfidence,
 };
 use lh_execution::LocalExecutionPlane;
 use lh_permission::{DefaultPermissionEngine, PermissionPrompter};
@@ -174,6 +174,81 @@ async fn a_root_session_driven_by_a_delegated_primary_round_trips_through_the_fa
     };
     assert_eq!(usage.cost_usd, Some(0.01));
     assert_eq!(usage.confidence, UsageConfidence::Estimated);
+}
+
+#[tokio::test]
+async fn terminal_create_output_wait_and_release_round_trip_through_the_fake_agent() {
+    // Exercises ACP's terminal/* capability end to end (the background
+    // task + monitor primitive ACP standardizes, architecture research
+    // note Aug 2026): the fake agent creates a terminal for a ~0.3s
+    // command, polls terminal/output immediately (must still be running),
+    // then terminal/wait_for_exit (must block until it finishes), then
+    // terminal/release. Proves both that HarnessAcpClient actually
+    // implements the client side of this capability, and that it's
+    // audited through the same ToolCallRequested/ToolCallUpdated events a
+    // native tool call gets.
+    std::env::set_var("LH_ACP_TEST_FAKE_KEY", "unused-by-the-fake-agent");
+
+    let workspace = tempfile::tempdir().unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+    let prompter = Arc::new(AlwaysAllow { calls: AtomicUsize::new(0) });
+    let permission_engine: Arc<dyn lh_permission::PermissionEngine> =
+        Arc::new(DefaultPermissionEngine::new(prompter.clone()));
+    let execution_plane: Arc<dyn lh_execution::ExecutionPlane> =
+        Arc::new(LocalExecutionPlane::new(workspace.path().to_path_buf()).await.unwrap());
+
+    let adapter = DelegatedAgentAdapter {
+        kind: AgentKind::ClaudeCode,
+        spawn: SpawnSpec {
+            command: "python3".to_string(),
+            args: vec![fixture_path().to_string_lossy().to_string()],
+            api_key_env: "LH_ACP_TEST_FAKE_KEY".to_string(),
+        },
+        can_be_primary: false,
+    };
+
+    let parent_session_id = SessionId::now_v7();
+    let child_session_id = SessionId::now_v7();
+
+    let outcome = lh_acp::delegate::run_delegation(
+        parent_session_id,
+        child_session_id,
+        workspace.path(),
+        &adapter,
+        "USE_TERMINAL please",
+        store.clone(),
+        permission_engine,
+        execution_plane,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(outcome, ChildOutcome::Success { .. }), "expected Success, got {outcome:?}");
+    // terminal/create is gated exactly like a native exec -- one live ask.
+    assert_eq!(prompter.calls.load(Ordering::SeqCst), 1, "exactly one live permission ask for terminal/create");
+
+    let child_events = store.read_from(child_session_id, 0).await.unwrap();
+    let kinds: Vec<&str> = child_events.iter().map(payload_kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "SessionDriverSet",
+            "UserMessage",
+            "PermissionRequested",
+            "PermissionDecided",
+            "ToolCallRequested",
+            "ToolCallUpdated",
+            "UsageReported",
+        ]
+    );
+
+    let EventPayload::ToolCallUpdated { status, output, .. } = &child_events[5].payload else {
+        panic!("expected ToolCallUpdated");
+    };
+    assert_eq!(*status, lh_event::ToolCallStatus::Completed);
+    let ContentBlock::Text { text } = output.as_ref().unwrap() else { panic!("expected text output") };
+    assert!(text.contains("background-start"), "got: {text}");
+    assert!(text.contains("background-done"), "got: {text}");
 }
 
 fn payload_kind(event: &lh_event::Event) -> &'static str {
