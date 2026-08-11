@@ -11,10 +11,16 @@ use ratatui::Frame;
 
 use crate::app::{App, ConnPhase, TranscriptItem};
 
+/// Highest input box height (in text lines, before the +2 for borders) --
+/// a multi-line prompt can grow the input box, but not so far that it
+/// crowds out the transcript entirely.
+const MAX_INPUT_LINES: u16 = 5;
+
 pub fn draw(frame: &mut Frame, app: &App) {
+    let input_lines = (app.input.line_count() as u16).min(MAX_INPUT_LINES);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3), Constraint::Length(1)])
+        .constraints([Constraint::Min(3), Constraint::Length(input_lines + 2), Constraint::Length(1)])
         .split(frame.area());
 
     draw_transcript(frame, chunks[0], app);
@@ -24,8 +30,26 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     let lines: Vec<Line> = app.transcript.iter().flat_map(transcript_lines).collect();
+    // Counts *logical* (pre-wrap) lines -- accurate scroll math for lines
+    // that fit within the terminal width; a long line that soft-wraps
+    // (`Wrap` below) renders as more visual rows than this counts, so
+    // scrolling near a wrapped line is approximate, not exact. Precise
+    // wrap-aware scrolling would need reimplementing ratatui's own
+    // wrapping calculation just to count rows -- not worth it for what's
+    // still a readable, correct-direction scroll experience.
+    let total = lines.len() as u16;
+    // Borders eat 2 rows; `area.height` can theoretically be 0 or 1 in a
+    // very small terminal, so this is saturating throughout rather than
+    // assuming there's always room for content.
+    let viewport = area.height.saturating_sub(2);
+    let max_scroll = total.saturating_sub(viewport);
+    // `app.transcript_scroll` counts lines scrolled *up* from the bottom;
+    // ratatui's `Paragraph::scroll` counts lines skipped from the *top* --
+    // converting here is what lets `App` stay ignorant of screen height.
+    let scroll_from_top = max_scroll.saturating_sub(app.transcript_scroll.min(max_scroll));
+
     let block = Block::default().borders(Borders::ALL).title(" lite-harness ");
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll_from_top, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -68,7 +92,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     } else if !app.input_enabled() {
         " waiting... "
     } else {
-        " prompt "
+        " prompt (Enter to send, Alt+Enter for a new line) "
     };
     let style = if app.input_enabled() {
         Style::default()
@@ -76,8 +100,13 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
     let block = Block::default().borders(Borders::ALL).title(title);
-    let paragraph = Paragraph::new(app.input.as_str()).style(style).block(block);
+    let paragraph = Paragraph::new(app.input.text()).style(style).block(block);
     frame.render_widget(paragraph, area);
+
+    if app.input_enabled() {
+        let (col, row) = app.input.cursor_row_col();
+        frame.set_cursor_position((area.x + 1 + col, area.y + 1 + row));
+    }
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -170,5 +199,43 @@ mod tests {
         app.pending_permission = Some(crate::app::PendingPermission { request_id: -1 });
         let backend = render(&app);
         assert!(buffer_contains(&backend, "allow? [y/n]"));
+    }
+
+    #[test]
+    fn a_multiline_input_grows_the_input_box_and_both_lines_are_visible() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        for c in "first line".chars() {
+            app.input.insert_char(c);
+        }
+        app.input.insert_newline();
+        for c in "second line".chars() {
+            app.input.insert_char(c);
+        }
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "first line"));
+        assert!(buffer_contains(&backend, "second line"));
+    }
+
+    #[test]
+    fn scrolling_up_reveals_older_content_and_hides_the_newest() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        // The 20-row TestBackend has well under 30 rows of transcript
+        // space once the input box and status bar are subtracted, so 30
+        // distinct system lines guarantees the transcript overflows and
+        // scrolling actually has something to reveal.
+        for i in 0..30 {
+            app.push_system(format!("line-{i}"));
+        }
+
+        let bottom = render(&app);
+        assert!(buffer_contains(&bottom, "line-29"), "pinned to the newest content by default");
+        assert!(!buffer_contains(&bottom, "line-0"), "oldest content shouldn't be visible yet");
+
+        app.scroll_up(100); // clamped for rendering, not stored -- see draw_transcript
+        let scrolled = render(&app);
+        assert!(buffer_contains(&scrolled, "line-0"), "scrolled all the way up to the oldest content");
+        assert!(!buffer_contains(&scrolled, "line-29"), "newest content scrolled out of view");
     }
 }

@@ -7,6 +7,8 @@
 use lh_event::{ContentBlock, Event, EventPayload, PermissionDecision, ToolCallStatus};
 use lh_protocol::RequestId;
 
+use crate::input::InputBox;
+
 #[derive(Debug, Clone)]
 pub enum TranscriptItem {
     User(String),
@@ -50,7 +52,13 @@ pub struct PendingPermission {
 pub struct App {
     pub phase: ConnPhase,
     pub transcript: Vec<TranscriptItem>,
-    pub input: String,
+    pub input: InputBox,
+    /// Lines scrolled *up* from the bottom (0 = pinned to the newest
+    /// content). A raw line count rather than a fraction/percentage so
+    /// `ui::draw` can clamp it against whatever the real viewport height
+    /// happens to be this frame, without `App` needing to know terminal
+    /// dimensions at all.
+    pub transcript_scroll: u16,
     pub session_id: Option<lh_event::SessionId>,
     pub pending: Option<(RequestId, PendingKind)>,
     pub pending_permission: Option<PendingPermission>,
@@ -63,7 +71,8 @@ impl App {
         Self {
             phase: ConnPhase::Connecting,
             transcript: Vec::new(),
-            input: String::new(),
+            input: InputBox::new(),
+            transcript_scroll: 0,
             session_id: None,
             pending: None,
             pending_permission: None,
@@ -76,6 +85,14 @@ impl App {
     /// not in the middle of answering a permission ask.
     pub fn input_enabled(&self) -> bool {
         self.phase == ConnPhase::Ready && self.pending.is_none() && self.pending_permission.is_none()
+    }
+
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_add(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(lines);
     }
 
     pub fn apply_session_event(&mut self, event: &Event) {
@@ -137,6 +154,13 @@ impl App {
 
     pub fn push_user_message(&mut self, text: String) {
         self.transcript.push(TranscriptItem::User(text));
+        // Sending a message is a clear signal the user wants to see what
+        // happens next -- jump back to the newest content even if they'd
+        // scrolled up to reread something earlier. Streamed content
+        // arriving via `apply_session_event` deliberately does *not* do
+        // this, so scrolling up mid-response to reread it doesn't get
+        // yanked back down involuntarily.
+        self.transcript_scroll = 0;
     }
 
     pub fn push_system(&mut self, text: impl Into<String>) {
@@ -331,5 +355,36 @@ mod tests {
         assert!(app.pending_permission.is_none());
 
         assert!(app.decide_pending_permission(false).is_none(), "nothing pending, should be a no-op");
+    }
+
+    #[test]
+    fn scroll_up_and_down_are_saturating_in_both_directions() {
+        let mut app = App::new();
+        app.scroll_down(5); // already at 0, must not wrap
+        assert_eq!(app.transcript_scroll, 0);
+
+        app.scroll_up(3);
+        assert_eq!(app.transcript_scroll, 3);
+        app.scroll_up(u16::MAX);
+        assert_eq!(app.transcript_scroll, u16::MAX, "must not overflow");
+
+        app.scroll_down(u16::MAX);
+        assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn sending_a_message_jumps_back_to_the_newest_content() {
+        let mut app = App::new();
+        app.scroll_up(10);
+        app.push_user_message("hi".to_string());
+        assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn streamed_content_does_not_disturb_a_manually_scrolled_position() {
+        let mut app = App::new();
+        app.scroll_up(10);
+        app.apply_session_event(&event(EventPayload::AgentMessageChunk { content: ContentBlock::text("more") }));
+        assert_eq!(app.transcript_scroll, 10, "reading old context shouldn't get yanked away by new streaming output");
     }
 }

@@ -122,32 +122,69 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
         return Ok(());
     }
 
+    // Scrolling the transcript works regardless of whether the input box
+    // is currently editable (e.g. re-reading context while a turn is still
+    // in flight), so it's checked before the `input_enabled()` gate below.
+    match key.code {
+        KeyCode::Up => {
+            app.scroll_up(1);
+            return Ok(());
+        }
+        KeyCode::Down => {
+            app.scroll_down(1);
+            return Ok(());
+        }
+        KeyCode::PageUp => {
+            app.scroll_up(SCROLL_PAGE_LINES);
+            return Ok(());
+        }
+        KeyCode::PageDown => {
+            app.scroll_down(SCROLL_PAGE_LINES);
+            return Ok(());
+        }
+        _ => {}
+    }
+
     if !app.input_enabled() {
         return Ok(());
     }
 
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
+        // Alt+Enter inserts a literal newline (multi-line prompts); plain
+        // Enter submits. Alt is reliably detected by crossterm without any
+        // special terminal protocol, unlike Shift+Enter.
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+            app.input.insert_newline();
+        }
         KeyCode::Enter => {
-            if app.input.trim().is_empty() {
+            if app.input.text().trim().is_empty() {
                 return Ok(());
             }
-            let text = std::mem::take(&mut app.input);
+            let text = app.input.take();
             app.push_user_message(text.clone());
             let prompt_id = client
                 .send_request(methods::SESSION_PROMPT, serde_json::to_value(SessionPromptParams { text })?)
                 .await?;
             app.pending = Some((prompt_id, PendingKind::Prompt));
         }
-        KeyCode::Backspace => {
-            app.input.pop();
-        }
-        KeyCode::Char(c) => {
-            app.input.push(c);
-        }
+        // Ctrl+Backspace and Ctrl+W both do readline's word-delete --
+        // terminals vary in whether they send a distinguishable
+        // Ctrl+Backspace at all, so Ctrl+W is the reliable one of the two.
+        KeyCode::Backspace if ctrl => app.input.delete_word_before_cursor(),
+        KeyCode::Char('w') if ctrl => app.input.delete_word_before_cursor(),
+        KeyCode::Backspace => app.input.backspace(),
+        KeyCode::Left => app.input.move_left(),
+        KeyCode::Right => app.input.move_right(),
+        KeyCode::Home => app.input.move_line_start(),
+        KeyCode::End => app.input.move_line_end(),
+        KeyCode::Char(c) => app.input.insert_char(c),
         _ => {}
     }
     Ok(())
 }
+
+const SCROLL_PAGE_LINES: u16 = 10;
 
 fn kind_label(kind: PendingKind) -> &'static str {
     match kind {
@@ -298,25 +335,104 @@ mod tests {
     async fn an_unrecognized_key_while_typing_is_a_no_op() {
         let mut app = App::new();
         app.phase = ConnPhase::Ready;
-        app.input = "unchanged".to_string();
+        app.input.insert_char('x');
         let mut client = inert_client().await;
 
-        handle_key(&mut app, &mut client, key(KeyCode::Left)).await.unwrap();
+        handle_key(&mut app, &mut client, key(KeyCode::Tab)).await.unwrap();
 
-        assert_eq!(app.input, "unchanged");
+        assert_eq!(app.input.text(), "x");
         assert!(app.pending.is_none());
     }
 
     #[tokio::test]
-    async fn backspace_removes_the_last_input_character() {
+    async fn backspace_removes_the_character_before_the_cursor() {
         let mut app = App::new();
         app.phase = ConnPhase::Ready;
-        app.input = "hi".to_string();
+        app.input.insert_char('h');
+        app.input.insert_char('i');
         let mut client = inert_client().await;
 
         handle_key(&mut app, &mut client, key(KeyCode::Backspace)).await.unwrap();
 
-        assert_eq!(app.input, "h");
+        assert_eq!(app.input.text(), "h");
+    }
+
+    #[tokio::test]
+    async fn left_and_right_arrows_move_the_cursor_without_changing_the_text() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.input.insert_char('a');
+        app.input.insert_char('c');
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Left)).await.unwrap();
+        app.input.insert_char('b');
+
+        assert_eq!(app.input.text(), "abc", "typed in the middle after moving left");
+
+        handle_key(&mut app, &mut client, key(KeyCode::Right)).await.unwrap();
+        assert_eq!(app.input.cursor(), 3, "moved right past the inserted 'b' to the end");
+    }
+
+    #[tokio::test]
+    async fn ctrl_w_deletes_the_word_before_the_cursor() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        for c in "run echo".chars() {
+            app.input.insert_char(c);
+        }
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)).await.unwrap();
+
+        assert_eq!(app.input.text(), "run ");
+    }
+
+    #[tokio::test]
+    async fn alt_enter_inserts_a_newline_instead_of_submitting() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.input.insert_char('a');
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)).await.unwrap();
+
+        assert_eq!(app.input.text(), "a\n");
+        assert!(app.pending.is_none(), "must not have submitted a prompt");
+    }
+
+    #[tokio::test]
+    async fn home_and_end_move_the_cursor_to_the_line_boundaries() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        for c in "hi".chars() {
+            app.input.insert_char(c);
+        }
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Home)).await.unwrap();
+        assert_eq!(app.input.cursor(), 0);
+
+        handle_key(&mut app, &mut client, key(KeyCode::End)).await.unwrap();
+        assert_eq!(app.input.cursor(), 2);
+    }
+
+    #[tokio::test]
+    async fn arrow_and_page_keys_scroll_the_transcript_even_while_input_is_disabled() {
+        let mut app = App::new(); // Connecting -> input disabled
+        let mut client = inert_client().await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.transcript_scroll, 1);
+
+        handle_key(&mut app, &mut client, key(KeyCode::PageUp)).await.unwrap();
+        assert_eq!(app.transcript_scroll, 11);
+
+        handle_key(&mut app, &mut client, key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.transcript_scroll, 10);
+
+        handle_key(&mut app, &mut client, key(KeyCode::PageDown)).await.unwrap();
+        assert_eq!(app.transcript_scroll, 0);
     }
 
     #[test]
