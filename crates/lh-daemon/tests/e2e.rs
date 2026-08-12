@@ -104,17 +104,28 @@ impl DaemonState {
 }
 
 fn mock_provider(base_url: &str) -> ResolvedProvider {
+    let cfg = lh_model_provider::ModelProviderConfig {
+        name: "mock".to_string(),
+        protocol: lh_model_provider::ProviderProtocol::OpenAiCompatible,
+        base_url: format!("{base_url}/v1"),
+        api_key_env: "LH_DAEMON_E2E_MOCK_PROVIDER_KEY".to_string(),
+        default_model: "mock-model".to_string(),
+        extra_headers: Default::default(),
+        context_window: None,
+    };
+    std::env::set_var(&cfg.api_key_env, "test-key");
     let provider = lh_model_provider::OpenAiCompatibleProvider::new(
-        format!("{base_url}/v1"),
+        cfg.base_url.clone(),
         "test-key",
-        "mock-model",
+        cfg.default_model.clone(),
         Default::default(),
     );
     ResolvedProvider {
         provider: Arc::new(provider),
-        name: "mock".to_string(),
-        model: "mock-model".to_string(),
-        context_window: None,
+        name: cfg.name.clone(),
+        model: cfg.default_model.clone(),
+        context_window: cfg.context_window,
+        config: cfg,
     }
 }
 
@@ -262,6 +273,48 @@ impl TestClient {
                 serde_json::from_value(resp.result.unwrap()).unwrap()
             }
             other => panic!("expected LedgerQueryResult, got {other:?}"),
+        }
+    }
+
+    /// A pending `SessionDriverSet` (or, in principle, any other streamed)
+    /// event notification can land on the wire before the matching
+    /// `models/list`/`model/select` response -- unlike `agents_list`/
+    /// `create_session`, which run before any session-scoped events exist
+    /// yet, these two are called *after* `create_session`, so a
+    /// notification racing ahead of the response is expected, not a bug.
+    async fn recv_response(&mut self, id: RequestId) -> Response {
+        loop {
+            match self.recv().await.unwrap() {
+                Message::Response(resp) => {
+                    assert_eq!(resp.id, id);
+                    return resp;
+                }
+                Message::Notification(_) => continue,
+                other => panic!("expected a Response (id {id}), got {other:?}"),
+            }
+        }
+    }
+
+    async fn models_list(&mut self) -> Result<lh_protocol::ModelsListResult, String> {
+        let id = self.send_request(methods::MODELS_LIST, serde_json::json!({})).await;
+        let resp = self.recv_response(id).await;
+        match resp.error {
+            Some(e) => Err(e.message),
+            None => Ok(serde_json::from_value(resp.result.unwrap()).unwrap()),
+        }
+    }
+
+    async fn model_select(&mut self, model: &str) -> Result<lh_protocol::ModelSelectResult, String> {
+        let id = self
+            .send_request(
+                methods::MODEL_SELECT,
+                serde_json::to_value(lh_protocol::ModelSelectParams { model: model.to_string() }).unwrap(),
+            )
+            .await;
+        let resp = self.recv_response(id).await;
+        match resp.error {
+            Some(e) => Err(e.message),
+            None => Ok(serde_json::from_value(resp.result.unwrap()).unwrap()),
         }
     }
 }
@@ -418,6 +471,98 @@ async fn session_create_omits_context_window_when_not_configured() {
 
     let create = client.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
     assert_eq!(create.context_window, None);
+}
+
+#[tokio::test]
+async fn models_list_reflects_the_endpoints_models_and_the_current_selection() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "mock-model"}, {"id": "mock-model-large"}]
+        })))
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let state = DaemonState::new(workspace.path()).await.with_provider(mock_provider(&server.uri()));
+    let mut client = state.connect();
+    client.initialize().await;
+    client.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+
+    let models = client.models_list().await.unwrap();
+    assert_eq!(models.current, "mock-model");
+    assert_eq!(
+        models.models,
+        vec![
+            lh_model_provider::ModelInfo { id: "mock-model".to_string() },
+            lh_model_provider::ModelInfo { id: "mock-model-large".to_string() },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn model_select_switches_the_connections_active_model_and_is_reflected_by_a_later_models_list() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "mock-model"}, {"id": "mock-model-large"}]
+        })))
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let state = DaemonState::new(workspace.path()).await.with_provider(mock_provider(&server.uri()));
+    let mut client = state.connect();
+    client.initialize().await;
+    client.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+
+    let select = client.model_select("mock-model-large").await.unwrap();
+    assert_eq!(select.model, "mock-model-large");
+
+    let models = client.models_list().await.unwrap();
+    assert_eq!(models.current, "mock-model-large");
+}
+
+#[tokio::test]
+async fn model_select_actually_changes_which_model_the_next_prompt_uses() {
+    let server = scripted_mock_server(vec![text_response("used the switched model")]).await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let state = DaemonState::new(workspace.path()).await.with_provider(mock_provider(&server.uri()));
+    let mut client = state.connect();
+    client.initialize().await;
+    client.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+    client.model_select("mock-model-large").await.unwrap();
+
+    let (result, _events) = client
+        .call_collecting_events(
+            methods::SESSION_PROMPT,
+            serde_json::to_value(SessionPromptParams { text: "hi".to_string() }).unwrap(),
+            PermissionDecision::Allow,
+        )
+        .await;
+    let prompt_result: SessionPromptResult = serde_json::from_value(result.unwrap()).unwrap();
+    assert_eq!(prompt_result.stop_reason, "EndTurn");
+    // A switched-but-otherwise-broken provider (e.g. the rebuild silently
+    // kept a dead connection) would fail this turn outright -- reaching
+    // EndTurn proves handle_session_prompt is reading the post-switch
+    // ResolvedProvider from conn_provider, not a stale one captured earlier.
+}
+
+#[tokio::test]
+async fn models_list_and_model_select_error_cleanly_with_no_provider_configured() {
+    let workspace = tempfile::tempdir().unwrap();
+    let state = DaemonState::new(workspace.path()).await;
+    let mut client = state.connect();
+    client.initialize().await;
+    client.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+
+    assert!(client.models_list().await.is_err());
+    assert!(client.model_select("whatever").await.is_err());
 }
 
 #[tokio::test]

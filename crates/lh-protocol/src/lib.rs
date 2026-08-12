@@ -140,6 +140,17 @@ pub mod methods {
     /// structurally, just conventionally placed there since that's the only
     /// point a client actually needs it.
     pub const AGENTS_LIST: &str = "agents/list";
+    /// Auto-discovers the models the connection's current provider config
+    /// serves (architecture §13, Phase 10.2) -- unlike `AGENTS_LIST`,
+    /// answerable at any point in the connection's lifetime, not just
+    /// before `session/create`: a developer can open the picker mid-REPL.
+    pub const MODELS_LIST: &str = "models/list";
+    /// Rebuilds this connection's active `ModelProvider` around a different
+    /// model id and swaps it into the connection's own mutable provider
+    /// state -- scoped to the calling connection only, never the daemon's
+    /// shared default, so one developer switching models never affects
+    /// another connected client.
+    pub const MODEL_SELECT: &str = "model/select";
     /// Streamed daemon -> client notification carrying an `lh_event::Event`.
     pub const EVENT: &str = "event";
 }
@@ -185,6 +196,13 @@ pub struct SessionCreateResult {
     /// auto-discovered, so `None` when unset rather than a guess.
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// The model id this session's provider is actually using -- lets a
+    /// client (`lh-tui`'s status bar, a future `/model` picker) show the
+    /// active model immediately, without a separate `models/list` round
+    /// trip just to learn the current selection. `None` only when no model
+    /// provider is configured on the daemon at all.
+    #[serde(default)]
+    pub current_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +272,28 @@ pub struct AgentInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentsListResult {
     pub agents: Vec<AgentInfo>,
+}
+
+/// No fields today -- same rationale as `AgentsListParams`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelsListParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsListResult {
+    pub models: Vec<lh_model_provider::ModelInfo>,
+    /// The model id this connection is actually using right now -- lets a
+    /// picker highlight the current selection without a separate query.
+    pub current: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSelectParams {
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSelectResult {
+    pub model: String,
 }
 
 // --- Newline-delimited JSON framing ---

@@ -65,6 +65,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // frame's own border rather than including it.
     if let Some(pending) = &app.pending_permission {
         draw_permission_modal(frame, inner, pending);
+    } else if app.model_picker_visible {
+        draw_model_picker(frame, inner, app);
     }
 }
 
@@ -220,6 +222,52 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
     )))
     .alignment(Alignment::Center);
     frame.render_widget(hint, hint_row);
+}
+
+/// `/model`'s picker overlay -- deliberately reuses the exact visual
+/// language `draw_autocomplete_dropdown` already established (rounded
+/// border, `theme::ACCENT`-highlighted selected row) rather than inventing
+/// new chrome for what's the same interaction shape (arrow-key navigate,
+/// Enter confirm) in a different place.
+fn draw_model_picker(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(50, 60, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(" select a model ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if app.available_models.is_empty() {
+        let empty = Paragraph::new(Line::from(Span::styled(
+            "no models reported by the provider's /v1/models endpoint",
+            Style::default().fg(theme::FG_MUTED),
+        )))
+        .wrap(Wrap { trim: false });
+        frame.render_widget(empty, inner);
+        return;
+    }
+
+    let selected = app.model_picker_selected.min(app.available_models.len() - 1);
+    let lines: Vec<Line> = app
+        .available_models
+        .iter()
+        .enumerate()
+        .map(|(i, model)| {
+            let is_current = Some(model.as_str()) == app.current_model.as_deref();
+            let marker = if is_current { "\u{25cf} " } else { "  " };
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::FG)
+            };
+            Line::from(Span::styled(format!("{marker}{model}"), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// A unified-diff line's style -- `+`/`-` lines get the matching tinted
@@ -542,6 +590,9 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     // A short id (mirrors a git short SHA) instead of the full UUID -- still
     // enough to tell sessions apart at a glance without dominating the line.
     let session_short = app.session_id.map(|id| id.to_string()[..8].to_string()).unwrap_or_else(|| "-".to_string());
+    // Omitted entirely (not shown as "-") when no provider is configured --
+    // there's genuinely no model to name, not an unknown one.
+    let model_segment = app.current_model.as_deref().map(|m| format!(" \u{b7} {m}")).unwrap_or_default();
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -551,7 +602,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let left = Line::from(vec![
         Span::styled("\u{25cf} ", Style::default().fg(phase_color)),
         Span::styled(
-            format!("{phase_label}{status_suffix} \u{b7} {session_short} \u{b7} Ctrl+C quit"),
+            format!("{phase_label}{status_suffix} \u{b7} {session_short}{model_segment} \u{b7} Ctrl+C quit"),
             Style::default().fg(theme::FG_MUTED),
         ),
     ]);
@@ -1046,6 +1097,67 @@ mod tests {
         let backend = render(&app);
         assert!(buffer_contains(&backend, "context 500"), "got: {}", dump(&backend));
         assert!(!buffer_contains(&backend, "context 500 /"), "no configured window -- no fraction to show");
+    }
+
+    #[test]
+    fn the_model_picker_shows_every_model_with_the_current_one_marked() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.model_picker_visible = true;
+        app.available_models = vec!["claude-sonnet-5".to_string(), "claude-opus-5".to_string()];
+        app.current_model = Some("claude-opus-5".to_string());
+        app.model_picker_selected = 1;
+
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "select a model"));
+        assert!(buffer_contains(&backend, "claude-sonnet-5"));
+        assert!(buffer_contains(&backend, "claude-opus-5"));
+    }
+
+    #[test]
+    fn the_model_picker_reports_no_models_when_the_endpoint_returned_none() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.model_picker_visible = true;
+        app.available_models = Vec::new();
+
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "no models reported"));
+    }
+
+    #[test]
+    fn the_model_picker_stays_hidden_when_not_visible() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.available_models = vec!["claude-sonnet-5".to_string()];
+
+        let backend = render(&app);
+        assert!(!buffer_contains(&backend, "select a model"));
+    }
+
+    #[test]
+    fn the_permission_modal_takes_priority_over_the_model_picker() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.model_picker_visible = true;
+        app.available_models = vec!["claude-sonnet-5".to_string()];
+        app.pending_permission =
+            Some(crate::app::PendingPermission { request_id: -1, request: crate::app::fake_permission_request(), selected: 0 });
+
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "permission requested"));
+        assert!(!buffer_contains(&backend, "select a model"));
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_current_model_once_known() {
+        let mut app = App::new();
+        let backend = render(&app);
+        assert!(!buffer_contains(&backend, "claude-sonnet-5"));
+
+        app.current_model = Some("claude-sonnet-5".to_string());
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "claude-sonnet-5"));
     }
 
     fn dump(backend: &TestBackend) -> String {

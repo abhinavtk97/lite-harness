@@ -36,10 +36,10 @@ use lh_orchestration::{ChildRunner, TaskHandoff};
 use lh_permission::{DefaultPermissionEngine, PermissionEngine, SessionPolicyStore, TomlPolicyStore};
 use lh_protocol::{
     buffered, methods, read_message, write_message, AgentInfo, AgentsListResult, InitializeResult,
-    LedgerQueryParams, LedgerQueryResult, Message, Notification, PermissionAskResult,
-    Request as ProtoRequest, RequestId, Response, SessionCreateParams, SessionCreateResult,
-    SessionDelegateParams, SessionDelegateResult, SessionPromptParams, SessionPromptResult,
-    PROTOCOL_VERSION,
+    LedgerQueryParams, LedgerQueryResult, Message, ModelSelectParams, ModelSelectResult, ModelsListResult,
+    Notification, PermissionAskResult, Request as ProtoRequest, RequestId, Response, SessionCreateParams,
+    SessionCreateResult, SessionDelegateParams, SessionDelegateResult, SessionPromptParams,
+    SessionPromptResult, PROTOCOL_VERSION,
 };
 use lh_store::SessionStore;
 use permission::SocketPrompter;
@@ -173,7 +173,17 @@ pub async fn handle_connection(
         ))
         .await?;
     let context_window = resolved_provider.as_ref().as_ref().and_then(|p| p.context_window);
-    respond(&write_half, req.id, SessionCreateResult { session_id, context_window }).await?;
+    let current_model = resolved_provider.as_ref().as_ref().map(|p| p.model.clone());
+    respond(&write_half, req.id, SessionCreateResult { session_id, context_window, current_model }).await?;
+
+    // Connection-scoped mutable provider state (Phase 10.2): seeded from
+    // the daemon-wide default, but a `model/select` on this connection only
+    // ever touches this connection's own copy -- `resolved_provider` itself
+    // (the `Arc<Option<ResolvedProvider>>` passed into `handle_connection`)
+    // stays the daemon's shared, read-only default for every other
+    // connection, exactly as before this phase.
+    let conn_provider: Arc<AsyncMutex<Option<ResolvedProvider>>> =
+        Arc::new(AsyncMutex::new((*resolved_provider).clone()));
 
     let prompter = SocketPrompter::new(write_half.clone());
     // Shared with `NativeAgentLoop` too (not just the engine below): native
@@ -215,7 +225,7 @@ pub async fn handle_connection(
                             session_id,
                             &workspace_root,
                             &store,
-                            &resolved_provider,
+                            &conn_provider,
                             &permission_engine,
                             &execution_plane,
                             &pricing,
@@ -248,6 +258,55 @@ pub async fn handle_connection(
                 match cost_ledger.rollup(params.session_id).await {
                     Ok(rollup) => respond(&write_half, req.id, LedgerQueryResult { rollup }).await?,
                     Err(e) => respond_err(&write_half, req.id, e.to_string()).await?,
+                }
+            }
+            Some(Message::Request(req)) if req.method == methods::MODELS_LIST => {
+                let guard = conn_provider.lock().await;
+                match guard.as_ref() {
+                    None => {
+                        drop(guard);
+                        respond_err(&write_half, req.id, "no model provider configured on the daemon").await?;
+                    }
+                    Some(p) => {
+                        let cfg = p.config.clone();
+                        let current = p.model.clone();
+                        drop(guard);
+                        match lh_model_provider::list_models(&cfg).await {
+                            Ok(models) => respond(&write_half, req.id, ModelsListResult { models, current }).await?,
+                            Err(e) => respond_err(&write_half, req.id, e.to_string()).await?,
+                        }
+                    }
+                }
+            }
+            Some(Message::Request(req)) if req.method == methods::MODEL_SELECT => {
+                let params: ModelSelectParams = serde_json::from_value(req.params)?;
+                let mut guard = conn_provider.lock().await;
+                match guard.as_ref() {
+                    None => {
+                        drop(guard);
+                        respond_err(&write_half, req.id, "no model provider configured on the daemon").await?;
+                    }
+                    Some(p) => {
+                        let mut new_cfg = p.config.clone();
+                        new_cfg.default_model = params.model.clone();
+                        match lh_model_provider::build_provider(&new_cfg) {
+                            Ok(provider) => {
+                                *guard = Some(ResolvedProvider {
+                                    provider,
+                                    name: new_cfg.name.clone(),
+                                    model: params.model.clone(),
+                                    context_window: new_cfg.context_window,
+                                    config: new_cfg,
+                                });
+                                drop(guard);
+                                respond(&write_half, req.id, ModelSelectResult { model: params.model }).await?;
+                            }
+                            Err(e) => {
+                                drop(guard);
+                                respond_err(&write_half, req.id, e.to_string()).await?;
+                            }
+                        }
+                    }
                 }
             }
             Some(Message::Request(req)) if req.method == methods::SESSION_DELEGATE => {
@@ -292,7 +351,7 @@ async fn handle_session_prompt(
     session_id: lh_event::SessionId,
     workspace_root: &std::path::Path,
     store: &Arc<dyn SessionStore>,
-    resolved_provider: &Arc<Option<ResolvedProvider>>,
+    conn_provider: &Arc<AsyncMutex<Option<ResolvedProvider>>>,
     permission_engine: &Arc<dyn PermissionEngine>,
     execution_plane: &Arc<dyn ExecutionPlane>,
     pricing: &Arc<PricingTable>,
@@ -304,14 +363,25 @@ async fn handle_session_prompt(
 ) -> Result<()> {
     let params: SessionPromptParams = serde_json::from_value(req.params)?;
 
-    let Some(ResolvedProvider { provider, name, model, context_window: _ }) = resolved_provider.as_ref() else {
+    // Locked briefly just to snapshot the current provider/model -- a
+    // `model/select` racing this read either lands before (this turn uses
+    // the old model) or after (the *next* turn uses the new one); either
+    // ordering is coherent, there's no torn read of the `ResolvedProvider`
+    // itself since the whole thing is replaced atomically under the lock.
+    let guard = conn_provider.lock().await;
+    let Some(ResolvedProvider { provider, name, model, context_window: _, config: _ }) = guard.as_ref() else {
+        drop(guard);
         respond_err(write_half, req.id, "no model provider configured on the daemon").await?;
         return Ok(());
     };
+    let provider = provider.clone();
+    let name = name.clone();
+    let model = model.clone();
+    drop(guard);
 
     let agent = Arc::new(NativeAgentLoop::new(
         store.clone(),
-        provider.clone(),
+        provider,
         permission_engine.clone(),
         execution_plane.clone(),
         pricing.clone(),

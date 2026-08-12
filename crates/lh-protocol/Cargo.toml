@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 lh-event = { path = "../lh-event" }
 lh-ledger = { path = "../lh-ledger" }
+lh-model-provider = { path = "../lh-model-provider" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

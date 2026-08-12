@@ -9,13 +9,23 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use lh_model_provider::ModelProvider;
+use lh_model_provider::{ModelProvider, ModelProviderConfig};
 
+/// `Clone` (a cheap `Arc` bump plus a couple of small owned fields) so a
+/// connection can seed its own mutable copy from the daemon-wide default at
+/// connection start (architecture Phase 10.2) -- switching models on one
+/// connection must never mutate what other connections see.
+#[derive(Clone)]
 pub struct ResolvedProvider {
     pub provider: Arc<dyn ModelProvider>,
     pub name: String,
     pub model: String,
     pub context_window: Option<u64>,
+    /// The config this provider was built from -- kept around (not just
+    /// discarded after `build_provider`) so `model/select` can rebuild a
+    /// provider around a different model id without needing a whole second
+    /// config-file read.
+    pub config: ModelProviderConfig,
 }
 
 fn providers_path() -> Option<PathBuf> {
@@ -53,6 +63,7 @@ pub fn resolve_default_provider() -> Result<Option<ResolvedProvider>> {
         name: cfg.name.clone(),
         model: cfg.default_model.clone(),
         context_window: cfg.context_window,
+        config: cfg.clone(),
     }))
 }
 

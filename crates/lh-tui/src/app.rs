@@ -50,6 +50,12 @@ pub enum PendingKind {
     SessionCreate,
     Prompt,
     Delegate,
+    /// `/model`'s round trip: opens the picker overlay once the response
+    /// arrives -- unlike `model/select` below, this one goes through the
+    /// same `app.pending` gate every other request/response pair uses,
+    /// since fetching the list is a normal blocking round trip, not a
+    /// fire-and-forget refresh.
+    ModelsList,
 }
 
 /// The full request is carried (not just its id) so the permission modal
@@ -213,6 +219,32 @@ pub struct App {
     /// manual per-provider-config figure (`None` when the operator hasn't
     /// set one), not auto-discovered.
     pub context_window: Option<u64>,
+    /// The model id this connection is actually using right now -- set from
+    /// `SessionCreateResult` at handshake time and updated again after a
+    /// successful `/model` switch. `None` only when no provider is
+    /// configured on the daemon at all.
+    pub current_model: Option<String>,
+    /// Populated once a `/model`'s `models/list` round trip completes --
+    /// just the ids, since that's all the picker (`ui::draw_model_picker`)
+    /// needs to display and send back.
+    pub available_models: Vec<String>,
+    /// Highlighted row in the model picker -- same "always clamp at the
+    /// point of use" convention as `autocomplete_selected`, not reset on
+    /// every render.
+    pub model_picker_selected: usize,
+    /// Whether the model picker overlay is currently showing -- distinct
+    /// from `available_models` being non-empty so it can be dismissed
+    /// (Esc) without losing the last-fetched list, and so a picker with
+    /// zero models (a `/v1/models` response with an empty `data`) is still
+    /// representable as "open, nothing to pick" rather than indistinguishable
+    /// from "closed".
+    pub model_picker_visible: bool,
+    /// The id of an in-flight `model/select`, if any -- tracked separately
+    /// from `app.pending` for the same reason `pending_ledger_query` is:
+    /// picking a model is a background confirmation, not something that
+    /// should gate typing (the picker itself already closed the moment
+    /// Enter was pressed, before this resolves).
+    pub pending_model_select: Option<RequestId>,
 }
 
 impl App {
@@ -241,6 +273,11 @@ impl App {
             sidebar_visible: true,
             last_turn_usage: None,
             context_window: None,
+            current_model: None,
+            available_models: Vec::new(),
+            model_picker_selected: 0,
+            model_picker_visible: false,
+            pending_model_select: None,
         }
     }
 
@@ -433,6 +470,14 @@ impl App {
             (self.autocomplete_selected + candidate_count - 1) % candidate_count
         };
     }
+
+    pub fn cycle_model_picker_selection(&mut self, forward: bool) {
+        let n = self.available_models.len();
+        if n == 0 {
+            return;
+        }
+        self.model_picker_selected = if forward { (self.model_picker_selected + 1) % n } else { (self.model_picker_selected + n - 1) % n };
+    }
 }
 
 /// One entry in the slash-command registry -- the single source of truth for
@@ -450,6 +495,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "quit", usage: "exit lite-harness-tui" },
     SlashCommand { name: "agents", usage: "list registered delegated agents" },
     SlashCommand { name: "delegate", usage: "<agent> <task summary...> -- hand a task to a delegated agent" },
+    SlashCommand { name: "model", usage: "open a picker to switch the active model" },
 ];
 
 /// Which `SLASH_COMMANDS` entries match `input_text` as typed so far -- only

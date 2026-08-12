@@ -57,6 +57,25 @@ pub async fn handle_client_event(
                 return Ok(());
             }
 
+            // Same fire-and-forget shape as the ledger refresh above --
+            // the picker already closed the moment Enter was pressed, so
+            // this response only needs to confirm the switch, never gate
+            // typing the way `app.pending` does.
+            if app.pending_model_select == Some(resp.id) {
+                app.pending_model_select = None;
+                if let Some(err) = resp.error {
+                    app.push_error(format!("model/select failed: {}", err.message));
+                    return Ok(());
+                }
+                if let Some(result) = resp.result {
+                    if let Ok(parsed) = serde_json::from_value::<lh_protocol::ModelSelectResult>(result) {
+                        app.push_system(format!("switched model to {}", parsed.model));
+                        app.current_model = Some(parsed.model);
+                    }
+                }
+                return Ok(());
+            }
+
             let Some((pending_id, kind)) = app.pending else { return Ok(()) };
             if resp.id != pending_id {
                 // Not what we're waiting on (e.g. a stray response to a
@@ -103,6 +122,7 @@ pub async fn handle_client_event(
                     let result: SessionCreateResult = serde_json::from_value(result)?;
                     app.session_id = Some(result.session_id);
                     app.context_window = result.context_window;
+                    app.current_model = result.current_model;
                     app.phase = ConnPhase::Ready;
                     app.status = "ready".to_string();
                 }
@@ -122,6 +142,13 @@ pub async fn handle_client_event(
                 PendingKind::Delegate => {
                     let result: SessionDelegateResult = serde_json::from_value(result)?;
                     app.push_system(format!("delegation finished ({}): {}", result.child_session_id, describe_child_outcome(&result.outcome)));
+                }
+                PendingKind::ModelsList => {
+                    let result: lh_protocol::ModelsListResult = serde_json::from_value(result)?;
+                    app.available_models = result.models.into_iter().map(|m| m.id).collect();
+                    app.model_picker_selected = app.available_models.iter().position(|m| m == &result.current).unwrap_or(0);
+                    app.current_model = Some(result.current);
+                    app.model_picker_visible = true;
                 }
             }
         }
@@ -172,6 +199,30 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 respond_to_permission(app, client, PermissionChoice::DenyAlways.decision()).await?;
             }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // The model picker overlay -- same reverse-video-highlighted-row visual
+    // language and arrow-key-navigate-then-Enter-confirm interaction as the
+    // autocomplete dropdown below, but checked first since it's a true
+    // overlay (opened by `/model`, `app.pending` already cleared by the time
+    // it's showing) rather than something that reads live off the input box.
+    if app.model_picker_visible {
+        match key.code {
+            KeyCode::Up => app.cycle_model_picker_selection(false),
+            KeyCode::Down => app.cycle_model_picker_selection(true),
+            KeyCode::Enter => {
+                if let Some(model) = app.available_models.get(app.model_picker_selected).cloned() {
+                    let id = client
+                        .send_request(methods::MODEL_SELECT, serde_json::to_value(lh_protocol::ModelSelectParams { model })?)
+                        .await?;
+                    app.pending_model_select = Some(id);
+                }
+                app.model_picker_visible = false;
+            }
+            KeyCode::Esc => app.model_picker_visible = false,
             _ => {}
         }
         return Ok(());
@@ -339,6 +390,7 @@ fn kind_label(kind: PendingKind) -> &'static str {
         PendingKind::SessionCreate => "session/create",
         PendingKind::Prompt => "session/prompt",
         PendingKind::Delegate => "session/delegate",
+        PendingKind::ModelsList => "models/list",
     }
 }
 
@@ -384,6 +436,10 @@ async fn handle_slash_command(app: &mut App, client: &mut DaemonClient, command:
                 .send_request(methods::SESSION_DELEGATE, serde_json::to_value(SessionDelegateParams { agent, task_summary })?)
                 .await?;
             app.pending = Some((id, PendingKind::Delegate));
+        }
+        "model" => {
+            let id = client.send_request(methods::MODELS_LIST, serde_json::json!({})).await?;
+            app.pending = Some((id, PendingKind::ModelsList));
         }
         other => app.push_error(format!("unknown command '/{other}' -- try /help")),
     }
@@ -1024,11 +1080,16 @@ mod tests {
         let mut client = inert_client().await;
         app.pending = Some((1, PendingKind::SessionCreate));
 
-        let create = SessionCreateResult { session_id: lh_event::SessionId::now_v7(), context_window: Some(200_000) };
+        let create = SessionCreateResult {
+            session_id: lh_event::SessionId::now_v7(),
+            context_window: Some(200_000),
+            current_model: Some("claude-sonnet-5".to_string()),
+        };
         let resp = Response::ok(1, serde_json::to_value(create).unwrap());
         handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
 
         assert_eq!(app.context_window, Some(200_000));
+        assert_eq!(app.current_model, Some("claude-sonnet-5".to_string()));
         assert_eq!(app.phase, ConnPhase::Ready);
     }
 
@@ -1038,11 +1099,13 @@ mod tests {
         let mut client = inert_client().await;
         app.pending = Some((1, PendingKind::SessionCreate));
 
-        let create = SessionCreateResult { session_id: lh_event::SessionId::now_v7(), context_window: None };
+        let create =
+            SessionCreateResult { session_id: lh_event::SessionId::now_v7(), context_window: None, current_model: None };
         let resp = Response::ok(1, serde_json::to_value(create).unwrap());
         handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
 
         assert_eq!(app.context_window, None);
+        assert_eq!(app.current_model, None);
     }
 
     #[tokio::test]
@@ -1172,6 +1235,128 @@ mod tests {
         submit_line(&mut app, &mut client, "/delegate claude-code fix the bug").await;
 
         assert_eq!(app.pending.map(|(_, kind)| kind), Some(PendingKind::Delegate));
+    }
+
+    #[tokio::test]
+    async fn slash_model_sends_models_list_and_tracks_it() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+
+        submit_line(&mut app, &mut client, "/model").await;
+
+        assert_eq!(app.pending.map(|(_, kind)| kind), Some(PendingKind::ModelsList));
+    }
+
+    #[tokio::test]
+    async fn models_list_completing_opens_the_picker_with_the_current_model_preselected() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        app.pending = Some((1, PendingKind::ModelsList));
+
+        let result = lh_protocol::ModelsListResult {
+            models: vec![
+                lh_model_provider::ModelInfo { id: "claude-sonnet-5".to_string() },
+                lh_model_provider::ModelInfo { id: "claude-opus-5".to_string() },
+            ],
+            current: "claude-opus-5".to_string(),
+        };
+        let resp = Response::ok(1, serde_json::to_value(result).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert!(app.model_picker_visible);
+        assert_eq!(app.available_models, vec!["claude-sonnet-5".to_string(), "claude-opus-5".to_string()]);
+        assert_eq!(app.current_model, Some("claude-opus-5".to_string()));
+        assert_eq!(app.model_picker_selected, 1, "the currently-active model should be preselected");
+    }
+
+    #[tokio::test]
+    async fn arrow_keys_cycle_the_model_pickers_selection_without_closing_it() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        app.model_picker_visible = true;
+        app.available_models = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        app.model_picker_selected = 0;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.model_picker_selected, 1);
+        assert!(app.model_picker_visible);
+
+        handle_key(&mut app, &mut client, key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.model_picker_selected, 0);
+        assert!(app.model_picker_visible);
+    }
+
+    #[tokio::test]
+    async fn escape_closes_the_model_picker_without_sending_a_selection() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        app.model_picker_visible = true;
+        app.available_models = vec!["a".to_string(), "b".to_string()];
+
+        handle_key(&mut app, &mut client, key(KeyCode::Esc)).await.unwrap();
+
+        assert!(!app.model_picker_visible);
+        assert!(app.pending_model_select.is_none());
+    }
+
+    #[tokio::test]
+    async fn enter_sends_model_select_for_the_highlighted_model_and_closes_the_picker() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        app.model_picker_visible = true;
+        app.available_models = vec!["a".to_string(), "b".to_string()];
+        app.model_picker_selected = 1;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Enter)).await.unwrap();
+
+        assert!(!app.model_picker_visible, "the picker closes immediately, before the response arrives");
+        assert!(app.pending_model_select.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_successful_model_select_response_updates_current_model_and_reports_it() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        app.pending_model_select = Some(7);
+
+        let result = lh_protocol::ModelSelectResult { model: "claude-opus-5".to_string() };
+        let resp = Response::ok(7, serde_json::to_value(result).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert!(app.pending_model_select.is_none());
+        assert_eq!(app.current_model, Some("claude-opus-5".to_string()));
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::System(t) if t.contains("switched model to claude-opus-5"))));
+    }
+
+    #[tokio::test]
+    async fn a_failed_model_select_response_reports_the_error_and_leaves_current_model_untouched() {
+        let mut app = ready_app();
+        app.current_model = Some("claude-sonnet-5".to_string());
+        let mut client = inert_client().await;
+        app.pending_model_select = Some(7);
+
+        let mut resp = Response::ok(7, serde_json::json!({}));
+        resp.result = None;
+        resp.error = Some(RpcError { code: -1, message: "no such model".to_string() });
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert!(app.pending_model_select.is_none());
+        assert_eq!(app.current_model, Some("claude-sonnet-5".to_string()), "a failed switch must not clobber the last-known model");
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::Error(t) if t.contains("model/select failed"))));
+    }
+
+    #[tokio::test]
+    async fn a_model_select_response_never_touches_the_main_pending_gate() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        app.pending = Some((5, PendingKind::Prompt)); // a real prompt is still in flight
+        app.pending_model_select = Some(7);
+
+        let result = lh_protocol::ModelSelectResult { model: "claude-opus-5".to_string() };
+        let resp = Response::ok(7, serde_json::to_value(result).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert_eq!(app.pending, Some((5, PendingKind::Prompt)), "the real pending prompt must be untouched");
     }
 
     #[tokio::test]
