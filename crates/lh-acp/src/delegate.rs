@@ -220,6 +220,8 @@ async fn run_delegation_inner(
         (_, None) => UsageDelta {
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             cost_usd: None,
             wall_ms,
             confidence: UsageConfidence::Unknown,
@@ -227,6 +229,8 @@ async fn run_delegation_inner(
         (before, Some(after)) => UsageDelta {
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             cost_usd: Some(after - before.unwrap_or(0.0)),
             wall_ms,
             // A diffed cumulative figure, not a true per-turn number --

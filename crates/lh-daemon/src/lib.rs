@@ -172,7 +172,8 @@ pub async fn handle_connection(
             },
         ))
         .await?;
-    respond(&write_half, req.id, SessionCreateResult { session_id }).await?;
+    let context_window = resolved_provider.as_ref().as_ref().and_then(|p| p.context_window);
+    respond(&write_half, req.id, SessionCreateResult { session_id, context_window }).await?;
 
     let prompter = SocketPrompter::new(write_half.clone());
     // Shared with `NativeAgentLoop` too (not just the engine below): native
@@ -303,7 +304,7 @@ async fn handle_session_prompt(
 ) -> Result<()> {
     let params: SessionPromptParams = serde_json::from_value(req.params)?;
 
-    let Some(ResolvedProvider { provider, name, model }) = resolved_provider.as_ref() else {
+    let Some(ResolvedProvider { provider, name, model, context_window: _ }) = resolved_provider.as_ref() else {
         respond_err(write_half, req.id, "no model provider configured on the daemon").await?;
         return Ok(());
     };

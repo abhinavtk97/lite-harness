@@ -244,6 +244,12 @@ pub enum UsageConfidence {
 pub struct UsageDelta {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Tokens served from / written to a prompt cache -- see
+    /// `lh_model_provider::ModelUsage`'s matching fields for the per-protocol
+    /// story on why `cache_write_tokens` is always `None` for OpenAI-shaped
+    /// providers. Purely informational: `cost_usd` below is not cache-aware.
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
     /// Money as f64 for the Phase 1 skeleton; a fixed-point type
     /// (e.g. `rust_decimal::Decimal`) is a drop-in swap later without
     /// changing the event schema's shape or call sites' logic.

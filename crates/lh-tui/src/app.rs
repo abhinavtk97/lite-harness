@@ -203,6 +203,16 @@ pub struct App {
     /// transcript full width, on top of `ui::draw_main`'s existing "only
     /// show it once there's something to show" rule.
     pub sidebar_visible: bool,
+    /// The most recent turn's raw `UsageDelta`, replaced wholesale on every
+    /// `UsageReported` event -- the live, RPC-free source for "this turn's
+    /// cache reads/writes" and "context used" (`input_tokens`), since
+    /// `last_ledger` is a cumulative sum across the whole session tree and
+    /// would double-count a growing, whole-history-resent conversation.
+    pub last_turn_usage: Option<lh_event::UsageDelta>,
+    /// The active model's context window, from `SessionCreateResult` -- a
+    /// manual per-provider-config figure (`None` when the operator hasn't
+    /// set one), not auto-discovered.
+    pub context_window: Option<u64>,
 }
 
 impl App {
@@ -229,6 +239,8 @@ impl App {
             autocomplete_selected: 0,
             autocomplete_dismissed: false,
             sidebar_visible: true,
+            last_turn_usage: None,
+            context_window: None,
         }
     }
 
@@ -319,6 +331,7 @@ impl App {
                     "{tag}usage: {cost} ({:?}, {}ms)",
                     usage.confidence, usage.wall_ms
                 )));
+                self.last_turn_usage = Some(usage.clone());
             }
             EventPayload::SessionDriverSet { driver } => {
                 self.transcript.push(TranscriptItem::System(format!("{tag}driver: {driver:?}")));
@@ -645,6 +658,8 @@ mod tests {
             usage: UsageDelta {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 cost_usd: Some(0.0025),
                 wall_ms: 120,
                 confidence: UsageConfidence::Exact,
@@ -653,6 +668,41 @@ mod tests {
         let TranscriptItem::System(text) = &app.transcript[0] else { panic!("expected System") };
         assert!(text.contains("$0.0025"), "got: {text}");
         assert!(text.contains("Exact"), "got: {text}");
+        assert_eq!(app.last_turn_usage.as_ref().unwrap().input_tokens, Some(10));
+    }
+
+    #[test]
+    fn last_turn_usage_is_replaced_wholesale_by_each_new_usage_reported_event() {
+        let mut app = app_with_root_session();
+        app.apply_session_event(&event(EventPayload::UsageReported {
+            usage: UsageDelta {
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                cache_read_tokens: Some(20),
+                cache_write_tokens: None,
+                cost_usd: Some(0.01),
+                wall_ms: 10,
+                confidence: UsageConfidence::Exact,
+            },
+        }));
+        assert_eq!(app.last_turn_usage.as_ref().unwrap().input_tokens, Some(100));
+
+        app.apply_session_event(&event(EventPayload::UsageReported {
+            usage: UsageDelta {
+                input_tokens: Some(5),
+                output_tokens: Some(2),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost_usd: Some(0.001),
+                wall_ms: 5,
+                confidence: UsageConfidence::Exact,
+            },
+        }));
+        // The second turn's usage entirely replaces the first -- this is
+        // "this turn's" usage, not a running accumulation (that's what
+        // `last_ledger` is for).
+        assert_eq!(app.last_turn_usage.as_ref().unwrap().input_tokens, Some(5));
+        assert_eq!(app.last_turn_usage.as_ref().unwrap().cache_read_tokens, None);
     }
 
     #[test]

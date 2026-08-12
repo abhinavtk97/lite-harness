@@ -734,6 +734,11 @@ impl ChildRunner for NativeAgentLoop {
 struct UsageAccumulator {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    /// Sum-what's-present, unlike `input_tokens`/`output_tokens` above --
+    /// see `add`'s doc comment for why these deliberately never set
+    /// `any_unknown`.
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     wall_ms: u64,
     any_unknown: bool,
 }
@@ -753,6 +758,14 @@ impl UsageAccumulator {
             (Some(_), None) => self.any_unknown = true,
             (None, None) => self.any_unknown = true,
         }
+        // Cache counts are supplementary, not core token accounting -- a
+        // provider that legitimately never reports a cache write (every
+        // OpenAI-compatible response, see `ModelUsage::cache_write_tokens`'s
+        // doc comment) must not downgrade the whole turn's confidence to
+        // `Unknown` just because this one field is absent. Sum whatever is
+        // present; a call that reports nothing simply doesn't move the total.
+        self.cache_read_tokens = sum_opt(self.cache_read_tokens, usage.cache_read_tokens);
+        self.cache_write_tokens = sum_opt(self.cache_write_tokens, usage.cache_write_tokens);
     }
 
     fn finish(self, provider_name: &str, model: &str, pricing: &lh_ledger::PricingTable) -> UsageDelta {
@@ -765,17 +778,34 @@ impl UsageAccumulator {
         // Pricing (architecture §7/§13.3): a known (provider, model) with
         // known token counts gets a real dollar figure; anything else --
         // an unpriced/self-hosted model, or a provider that didn't report
-        // usage -- stays an honest `Unknown` rather than a guess.
+        // usage -- stays an honest `Unknown` rather than a guess. Cache
+        // tokens are not folded into this -- see `UsageDelta::cost_usd`'s
+        // doc comment.
         let (cost_usd, price_confidence) =
             lh_ledger::price_usage(pricing, provider_name, model, self.input_tokens, self.output_tokens);
 
         UsageDelta {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
             cost_usd,
             wall_ms: self.wall_ms,
             confidence: worse(token_confidence, price_confidence),
         }
+    }
+}
+
+/// Sum-what's-present-else-None, deliberately distinct from the
+/// `any_unknown`-tracking `match` blocks in `UsageAccumulator::add` --
+/// absence here is not itself informative the way a missing core token
+/// count is.
+fn sum_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
     }
 }
 
@@ -872,6 +902,7 @@ mod tests {
             usage: ModelUsage {
                 input_tokens: Some(10),
                 output_tokens: Some(5),
+                ..Default::default()
             },
         }
     }
@@ -887,6 +918,7 @@ mod tests {
             usage: ModelUsage {
                 input_tokens: Some(20),
                 output_tokens: Some(8),
+                ..Default::default()
             },
         }
     }
@@ -905,6 +937,7 @@ mod tests {
             usage: ModelUsage {
                 input_tokens: Some(15),
                 output_tokens: Some(6),
+                ..Default::default()
             },
         }
     }
@@ -1826,19 +1859,19 @@ mod tests {
         let mut acc = UsageAccumulator::default();
 
         // Neither side has ever reported anything -- the (None, None) arms.
-        acc.add(ModelUsage { input_tokens: None, output_tokens: None }, 5);
+        acc.add(ModelUsage { input_tokens: None, output_tokens: None, ..Default::default() }, 5);
         assert!(acc.any_unknown);
         assert_eq!(acc.input_tokens, None);
         assert_eq!(acc.output_tokens, None);
 
         // A later call that does report tokens still sets them.
-        acc.add(ModelUsage { input_tokens: Some(10), output_tokens: Some(4) }, 5);
+        acc.add(ModelUsage { input_tokens: Some(10), output_tokens: Some(4), ..Default::default() }, 5);
         assert_eq!(acc.input_tokens, Some(10));
         assert_eq!(acc.output_tokens, Some(4));
 
         // A call after that with no usage at all must flip any_unknown via
         // the (Some(_), None) arms, not silently drop what was accumulated.
-        acc.add(ModelUsage { input_tokens: None, output_tokens: None }, 5);
+        acc.add(ModelUsage { input_tokens: None, output_tokens: None, ..Default::default() }, 5);
         assert_eq!(acc.input_tokens, Some(10), "a call with no usage must not erase tokens already accumulated");
         assert_eq!(acc.output_tokens, Some(4));
         assert!(acc.any_unknown);
@@ -1846,6 +1879,58 @@ mod tests {
 
         let delta = acc.finish("anthropic", "test-model", &lh_ledger::PricingTable::new());
         assert_eq!(delta.confidence, UsageConfidence::Unknown, "any missing token count must taint the whole turn");
+    }
+
+    #[test]
+    fn usage_accumulator_sums_cache_tokens_without_tainting_confidence_when_absent() {
+        let mut acc = UsageAccumulator::default();
+
+        // A call reporting core tokens but no cache fields at all -- the
+        // common OpenAI-compatible-write / any-provider-first-turn shape.
+        acc.add(
+            ModelUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+            5,
+        );
+        assert_eq!(acc.cache_read_tokens, None);
+        assert_eq!(acc.cache_write_tokens, None);
+        assert!(!acc.any_unknown, "an absent cache field must not taint core-token confidence");
+
+        // A later call that does report cache reads/writes accumulates them.
+        acc.add(
+            ModelUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(30),
+                cache_write_tokens: Some(8),
+            },
+            5,
+        );
+        assert_eq!(acc.cache_read_tokens, Some(30));
+        assert_eq!(acc.cache_write_tokens, Some(8));
+
+        // A third call summing on top of an already-populated total.
+        acc.add(
+            ModelUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(20),
+                cache_write_tokens: None,
+            },
+            5,
+        );
+        assert_eq!(acc.cache_read_tokens, Some(50));
+        assert_eq!(acc.cache_write_tokens, Some(8), "a call reporting no cache write must not erase the running total");
+        assert!(!acc.any_unknown);
+
+        let delta = acc.finish("anthropic", "claude-sonnet-4", &lh_ledger::PricingTable::with_builtin_defaults());
+        assert_eq!(delta.cache_read_tokens, Some(50));
+        assert_eq!(delta.cache_write_tokens, Some(8));
+        assert_eq!(delta.confidence, UsageConfidence::Exact, "a priced model with no missing core tokens must stay Exact despite cache fields being absent on one call");
     }
 
     #[test]

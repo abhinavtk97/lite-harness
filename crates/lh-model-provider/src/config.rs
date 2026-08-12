@@ -25,6 +25,12 @@ pub struct ModelProviderConfig {
     pub default_model: String,
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// A manual override, not auto-discovered -- neither provider's public
+    /// models-list response reliably reports context length in a normalized
+    /// way. Applies to whichever model this config's `default_model` (or a
+    /// later `model/select`) currently names. Omitted/absent when unset.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

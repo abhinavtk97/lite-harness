@@ -195,6 +195,10 @@ enum WireRespBlock {
 struct WireUsage {
     input_tokens: u64,
     output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 fn from_wire_response(wire: WireResponse) -> ModelResponse {
@@ -223,6 +227,8 @@ fn from_wire_response(wire: WireResponse) -> ModelResponse {
         usage: ModelUsage {
             input_tokens: Some(wire.usage.input_tokens),
             output_tokens: Some(wire.usage.output_tokens),
+            cache_read_tokens: wire.usage.cache_read_input_tokens,
+            cache_write_tokens: wire.usage.cache_creation_input_tokens,
         },
     }
 }
@@ -313,6 +319,75 @@ mod tests {
         let uses = resp.tool_uses();
         assert_eq!(uses.len(), 1);
         assert_eq!(uses[0].1, "read_file");
+    }
+
+    #[tokio::test]
+    async fn parses_cache_read_and_write_tokens_from_the_wire_response() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "hello"}],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 100,
+                    "cache_creation_input_tokens": 20
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            AnthropicProtocolProvider::new(server.uri(), "test-key", "claude-test", HashMap::new());
+
+        let resp = provider
+            .complete(ModelRequest {
+                model: "claude-test".to_string(),
+                system: None,
+                messages: vec![ChatMessage::user_text("hi")],
+                tools: vec![],
+                max_tokens: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.usage.cache_read_tokens, Some(100));
+        assert_eq!(resp.usage.cache_write_tokens, Some(20));
+    }
+
+    #[tokio::test]
+    async fn cache_tokens_are_none_when_the_wire_response_omits_them() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "hello"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            AnthropicProtocolProvider::new(server.uri(), "test-key", "claude-test", HashMap::new());
+
+        let resp = provider
+            .complete(ModelRequest {
+                model: "claude-test".to_string(),
+                system: None,
+                messages: vec![ChatMessage::user_text("hi")],
+                tools: vec![],
+                max_tokens: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.usage.cache_read_tokens, None);
+        assert_eq!(resp.usage.cache_write_tokens, None);
     }
 
     #[test]

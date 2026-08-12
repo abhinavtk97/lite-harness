@@ -241,9 +241,15 @@ fn diff_line_style(line: &str) -> Style {
 /// sessions) the transcript alone fills the whole row, exactly like before
 /// this phase -- it only appears once there's something worth showing, and
 /// (new this phase) only while `app.sidebar_visible` -- `Ctrl+B` toggles it
-/// off to reclaim the width for the transcript.
+/// off to reclaim the width for the transcript. Once a session exists there
+/// is always at least the usage panel worth showing (even "0 tokens, $0.00"
+/// is informative) -- this is the "visible by default" behavior asked for,
+/// not gated behind a plan/subagent/background-bash existing first.
 fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
-    let has_content = !app.plan_steps.is_empty() || !app.child_sessions.is_empty() || !app.background_bash.is_empty();
+    let has_content = !app.plan_steps.is_empty()
+        || !app.child_sessions.is_empty()
+        || !app.background_bash.is_empty()
+        || app.session_id.is_some();
     if !has_content || !app.sidebar_visible {
         draw_transcript(frame, area, app);
         return;
@@ -315,6 +321,57 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
+    // Shown whenever a session exists, even before any usage has streamed in
+    // yet ("0 tokens, $0.00" is still informative) -- this, plus `draw_main`'s
+    // `has_content` gate including `session_id.is_some()`, is what makes the
+    // panel visible by default rather than only appearing once a plan/
+    // subagent/background process shows up.
+    if app.session_id.is_some() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled("usage", Style::default().add_modifier(Modifier::BOLD))));
+
+        let (input, output, cost) = match &app.last_ledger {
+            Some(rollup) => (
+                rollup.input_tokens.map(format_token_count).unwrap_or_else(|| "-".to_string()),
+                rollup.output_tokens.map(format_token_count).unwrap_or_else(|| "-".to_string()),
+                match rollup.cost_usd {
+                    Some(usd) => format!("${usd:.4}"),
+                    None => "$?".to_string(),
+                },
+            ),
+            None => ("-".to_string(), "-".to_string(), "$0.0000".to_string()),
+        };
+        lines.push(Line::from(Span::styled(format!("tokens {input} in / {output} out"), Style::default().fg(theme::FG))));
+        lines.push(Line::from(Span::styled(format!("cost {cost} total"), Style::default().fg(theme::FG))));
+
+        // Cache counts, cumulative across the session -- only shown once the
+        // ledger has actually reported one, rather than a permanent "-/-"
+        // row for providers that never populate these fields.
+        if let Some(rollup) = &app.last_ledger {
+            if rollup.cache_read_tokens.is_some() || rollup.cache_write_tokens.is_some() {
+                let read = rollup.cache_read_tokens.map(format_token_count).unwrap_or_else(|| "-".to_string());
+                let write = rollup.cache_write_tokens.map(format_token_count).unwrap_or_else(|| "-".to_string());
+                lines.push(Line::from(Span::styled(format!("cache {read} read / {write} write"), Style::default().fg(theme::FG_MUTED))));
+            }
+        }
+
+        // The latest single turn's input tokens, not the cumulative rollup
+        // above -- the whole growing conversation is resent every turn, so
+        // summing across turns would double-count what "context used" means.
+        if let Some(input) = app.last_turn_usage.as_ref().and_then(|u| u.input_tokens) {
+            let context_line = match app.context_window {
+                Some(window) if window > 0 => {
+                    let pct = (input as f64 / window as f64 * 100.0).round() as u64;
+                    format!("context {} / {} ({pct}%)", format_token_count(input), format_token_count(window))
+                }
+                _ => format!("context {}", format_token_count(input)),
+            };
+            lines.push(Line::from(Span::styled(context_line, Style::default().fg(theme::FG_MUTED))));
+        }
+    }
+
     // A thin left divider against the outer frame's own border, not a full
     // box of its own -- each section's own bold header ("tasks 2/5",
     // "sessions", "background") already says what it is, so there's no
@@ -322,6 +379,16 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::LEFT).border_style(Style::default().fg(theme::FG_MUTED));
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+/// `"850"`/`"12.3k"` -- compact enough that a token count never forces the
+/// 30-column sidebar to wrap mid-number.
+fn format_token_count(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
@@ -879,6 +946,8 @@ mod tests {
             session_id: lh_event::SessionId::now_v7(),
             input_tokens: Some(10),
             output_tokens: Some(5),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             cost_usd: Some(0.0025),
             turns: 1,
             confidence: lh_event::UsageConfidence::Exact,
@@ -890,5 +959,104 @@ mod tests {
             "got: {:?}",
             status_line_text(&backend)
         );
+    }
+
+    #[test]
+    fn a_session_with_no_usage_yet_still_shows_the_usage_panel_by_default() {
+        let mut app = App::new();
+        app.session_id = Some(lh_event::SessionId::now_v7());
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "usage"), "a fresh session should show the panel, not stay hidden");
+        assert!(buffer_contains(&backend, "$0.0000"));
+    }
+
+    #[test]
+    fn a_ledger_rollup_renders_token_and_cost_totals_in_the_sidebar() {
+        let mut app = App::new();
+        app.session_id = Some(lh_event::SessionId::now_v7());
+        app.last_ledger = Some(lh_ledger::LedgerRollup {
+            session_id: lh_event::SessionId::now_v7(),
+            input_tokens: Some(1500),
+            output_tokens: Some(200),
+            cache_read_tokens: Some(900),
+            cache_write_tokens: Some(50),
+            cost_usd: Some(0.0123),
+            turns: 2,
+            confidence: lh_event::UsageConfidence::Exact,
+            children: Vec::new(),
+        });
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "1.5k in"), "got: {}", dump(&backend));
+        assert!(buffer_contains(&backend, "200 out"));
+        assert!(buffer_contains(&backend, "$0.0123"));
+        assert!(buffer_contains(&backend, "900 read"));
+        assert!(buffer_contains(&backend, "50 write"));
+    }
+
+    #[test]
+    fn cache_line_is_omitted_when_the_ledger_never_reported_cache_tokens() {
+        let mut app = App::new();
+        app.session_id = Some(lh_event::SessionId::now_v7());
+        app.last_ledger = Some(lh_ledger::LedgerRollup {
+            session_id: lh_event::SessionId::now_v7(),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: Some(0.001),
+            turns: 1,
+            confidence: lh_event::UsageConfidence::Exact,
+            children: Vec::new(),
+        });
+        let backend = render(&app);
+        assert!(!buffer_contains(&backend, "cache"), "no provider ever reported cache tokens -- no row to show");
+    }
+
+    #[test]
+    fn context_usage_shows_the_latest_turns_input_tokens_against_a_known_window() {
+        let mut app = App::new();
+        app.session_id = Some(lh_event::SessionId::now_v7());
+        app.context_window = Some(200_000);
+        app.last_turn_usage = Some(lh_event::UsageDelta {
+            input_tokens: Some(20_000),
+            output_tokens: Some(100),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: Some(0.01),
+            wall_ms: 5,
+            confidence: lh_event::UsageConfidence::Exact,
+        });
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "context 20.0k / 200.0k (10%)"), "got: {}", dump(&backend));
+    }
+
+    #[test]
+    fn context_usage_shows_the_raw_count_when_no_window_is_configured() {
+        let mut app = App::new();
+        app.session_id = Some(lh_event::SessionId::now_v7());
+        app.last_turn_usage = Some(lh_event::UsageDelta {
+            input_tokens: Some(500),
+            output_tokens: Some(10),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: Some(0.001),
+            wall_ms: 5,
+            confidence: lh_event::UsageConfidence::Exact,
+        });
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "context 500"), "got: {}", dump(&backend));
+        assert!(!buffer_contains(&backend, "context 500 /"), "no configured window -- no fraction to show");
+    }
+
+    fn dump(backend: &TestBackend) -> String {
+        let buffer = backend.buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
     }
 }

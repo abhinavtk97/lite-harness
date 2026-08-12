@@ -35,6 +35,10 @@ pub struct LedgerRollup {
     pub session_id: SessionId,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Summed across this subtree, purely informational -- not folded into
+    /// `cost_usd` (see `UsageDelta::cost_usd`'s doc comment in `lh-event`).
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     /// Number of `UsageReported` events in this session alone (not
     /// counting children).
@@ -96,6 +100,8 @@ impl CostLedger for StoreBackedCostLedger {
 struct NodeAccumulator {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
     cost_usd: Option<f64>,
     turns: usize,
     confidence: Option<UsageConfidence>,
@@ -106,6 +112,8 @@ impl NodeAccumulator {
         self.turns += 1;
         self.input_tokens = add_opt_u64(self.input_tokens, usage.input_tokens);
         self.output_tokens = add_opt_u64(self.output_tokens, usage.output_tokens);
+        self.cache_read_tokens = add_opt_u64(self.cache_read_tokens, usage.cache_read_tokens);
+        self.cache_write_tokens = add_opt_u64(self.cache_write_tokens, usage.cache_write_tokens);
         self.cost_usd = add_opt_f64(self.cost_usd, usage.cost_usd);
         self.confidence = Some(match self.confidence {
             Some(existing) => worse(existing, usage.confidence),
@@ -118,6 +126,8 @@ impl NodeAccumulator {
             session_id,
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_write_tokens: self.cache_write_tokens,
             cost_usd: self.cost_usd,
             turns: self.turns,
             // A session with zero turns of its own (e.g. a parent that
@@ -166,6 +176,8 @@ fn worse(a: UsageConfidence, b: UsageConfidence) -> UsageConfidence {
 fn combine(mut parent: LedgerRollup, child: LedgerRollup) -> LedgerRollup {
     parent.input_tokens = add_opt_u64(parent.input_tokens, child.input_tokens);
     parent.output_tokens = add_opt_u64(parent.output_tokens, child.output_tokens);
+    parent.cache_read_tokens = add_opt_u64(parent.cache_read_tokens, child.cache_read_tokens);
+    parent.cache_write_tokens = add_opt_u64(parent.cache_write_tokens, child.cache_write_tokens);
     parent.cost_usd = add_opt_f64(parent.cost_usd, child.cost_usd);
     parent.confidence = worse(parent.confidence, child.confidence);
     parent.children.push(child);
@@ -195,6 +207,8 @@ mod tests {
         UsageDelta {
             input_tokens: Some(input),
             output_tokens: Some(output),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             cost_usd: Some(cost),
             wall_ms: 10,
             confidence: UsageConfidence::Exact,
@@ -205,6 +219,8 @@ mod tests {
         UsageDelta {
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             cost_usd: None,
             wall_ms: 10,
             confidence: UsageConfidence::Unknown,
@@ -268,6 +284,77 @@ mod tests {
         assert_eq!(rollup.cost_usd, Some(0.01));
         // ...but the tree-wide confidence reflects the unpriced child.
         assert_eq!(rollup.confidence, UsageConfidence::Unknown);
+    }
+
+    #[tokio::test]
+    async fn cache_tokens_sum_across_turns_and_a_childs_cache_totals_roll_into_the_parent() {
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let root = SessionId::now_v7();
+        let child = SessionId::now_v7();
+
+        store.append(driver_event(root, None)).await.unwrap();
+        store
+            .append(usage_event(
+                root,
+                UsageDelta {
+                    input_tokens: Some(100),
+                    output_tokens: Some(50),
+                    cache_read_tokens: Some(30),
+                    cache_write_tokens: Some(10),
+                    cost_usd: Some(0.01),
+                    wall_ms: 10,
+                    confidence: UsageConfidence::Exact,
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .append(usage_event(
+                root,
+                UsageDelta {
+                    input_tokens: Some(20),
+                    output_tokens: Some(5),
+                    cache_read_tokens: Some(15),
+                    // A turn that reports no cache write must not erase the
+                    // running total accumulated from the sibling turn above.
+                    cache_write_tokens: None,
+                    cost_usd: Some(0.01),
+                    wall_ms: 10,
+                    confidence: UsageConfidence::Exact,
+                },
+            ))
+            .await
+            .unwrap();
+
+        store.append(driver_event(child, Some(root))).await.unwrap();
+        store
+            .append(usage_event(
+                child,
+                UsageDelta {
+                    input_tokens: Some(5),
+                    output_tokens: Some(5),
+                    cache_read_tokens: Some(7),
+                    cache_write_tokens: Some(2),
+                    cost_usd: Some(0.001),
+                    wall_ms: 10,
+                    confidence: UsageConfidence::Exact,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let ledger = StoreBackedCostLedger::new(store);
+        let rollup = ledger.rollup(root).await.unwrap();
+
+        // Root's own two turns (30 + 15) plus the child's (7), via `combine`.
+        assert_eq!(rollup.cache_read_tokens, Some(52));
+        // Root's own two turns (10, then a turn with no write at all -- must
+        // not erase the running total) plus the child's (2).
+        assert_eq!(rollup.cache_write_tokens, Some(12));
+
+        assert_eq!(rollup.children.len(), 1);
+        assert_eq!(rollup.children[0].cache_read_tokens, Some(7));
+        assert_eq!(rollup.children[0].cache_write_tokens, Some(2));
     }
 
     #[tokio::test]

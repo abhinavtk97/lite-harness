@@ -114,6 +114,7 @@ fn mock_provider(base_url: &str) -> ResolvedProvider {
         provider: Arc::new(provider),
         name: "mock".to_string(),
         model: "mock-model".to_string(),
+        context_window: None,
     }
 }
 
@@ -391,6 +392,32 @@ async fn agents_list_reflects_a_configured_delegated_agent() {
     // Queryable more than once, before session/create -- not a one-shot.
     let agents2 = client.agents_list().await;
     assert_eq!(agents2.agents.len(), 1);
+}
+
+#[tokio::test]
+async fn session_create_surfaces_the_configured_context_window() {
+    let server = MockServer::start().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let mut provider = mock_provider(&server.uri());
+    provider.context_window = Some(200_000);
+    let state = DaemonState::new(workspace.path()).await.with_provider(provider);
+    let mut client = state.connect();
+    client.initialize().await;
+
+    let create = client.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+    assert_eq!(create.context_window, Some(200_000));
+}
+
+#[tokio::test]
+async fn session_create_omits_context_window_when_not_configured() {
+    let server = MockServer::start().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let state = DaemonState::new(workspace.path()).await.with_provider(mock_provider(&server.uri()));
+    let mut client = state.connect();
+    client.initialize().await;
+
+    let create = client.create_session(workspace.path(), PrimarySelector::Native).await.unwrap();
+    assert_eq!(create.context_window, None);
 }
 
 #[tokio::test]

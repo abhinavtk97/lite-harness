@@ -102,6 +102,7 @@ pub async fn handle_client_event(
                 PendingKind::SessionCreate => {
                     let result: SessionCreateResult = serde_json::from_value(result)?;
                     app.session_id = Some(result.session_id);
+                    app.context_window = result.context_window;
                     app.phase = ConnPhase::Ready;
                     app.status = "ready".to_string();
                 }
@@ -937,6 +938,8 @@ mod tests {
             session_id: lh_event::SessionId::now_v7(),
             input_tokens: Some(10),
             output_tokens: Some(4),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             cost_usd: Some(0.0012),
             turns: 1,
             confidence: lh_event::UsageConfidence::Exact,
@@ -1013,6 +1016,33 @@ mod tests {
 
         assert_eq!(app.available_agents.len(), 1);
         assert_eq!(app.pending.map(|(_, kind)| kind), Some(PendingKind::SessionCreate));
+    }
+
+    #[tokio::test]
+    async fn session_create_completing_captures_the_configured_context_window() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending = Some((1, PendingKind::SessionCreate));
+
+        let create = SessionCreateResult { session_id: lh_event::SessionId::now_v7(), context_window: Some(200_000) };
+        let resp = Response::ok(1, serde_json::to_value(create).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert_eq!(app.context_window, Some(200_000));
+        assert_eq!(app.phase, ConnPhase::Ready);
+    }
+
+    #[tokio::test]
+    async fn session_create_completing_with_no_context_window_configured_leaves_it_none() {
+        let mut app = App::new();
+        let mut client = inert_client().await;
+        app.pending = Some((1, PendingKind::SessionCreate));
+
+        let create = SessionCreateResult { session_id: lh_event::SessionId::now_v7(), context_window: None };
+        let resp = Response::ok(1, serde_json::to_value(create).unwrap());
+        handle_client_event(&mut app, &mut client, std::path::Path::new("."), ClientEvent::Response(resp)).await.unwrap();
+
+        assert_eq!(app.context_window, None);
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ pub struct ResolvedProvider {
     pub provider: Arc<dyn ModelProvider>,
     pub name: String,
     pub model: String,
+    pub context_window: Option<u64>,
 }
 
 fn providers_path() -> Option<PathBuf> {
@@ -51,6 +52,7 @@ pub fn resolve_default_provider() -> Result<Option<ResolvedProvider>> {
         provider,
         name: cfg.name.clone(),
         model: cfg.default_model.clone(),
+        context_window: cfg.context_window,
     }))
 }
 

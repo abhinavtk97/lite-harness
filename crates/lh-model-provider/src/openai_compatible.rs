@@ -250,6 +250,17 @@ struct WireRespFunctionCall {
 struct WireUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptTokensDetails>,
+}
+
+/// OpenAI-shaped caching is automatic/transparent server-side (unlike
+/// Anthropic's explicit cache-control blocks), so only a read count is ever
+/// reported here -- there's no equivalent "cache write" figure to parse.
+#[derive(Deserialize)]
+struct WirePromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 fn from_wire_response(wire: WireResponse) -> ModelResponse {
@@ -296,6 +307,8 @@ fn from_wire_response(wire: WireResponse) -> ModelResponse {
             .map(|u| ModelUsage {
                 input_tokens: Some(u.prompt_tokens),
                 output_tokens: Some(u.completion_tokens),
+                cache_read_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                cache_write_tokens: None,
             })
             .unwrap_or_default(),
     }
@@ -347,6 +360,78 @@ mod tests {
         assert_eq!(resp.stop_reason, StopReason::EndTurn);
         assert_eq!(resp.usage.input_tokens, Some(12));
         assert_eq!(resp.usage.output_tokens, Some(6));
+    }
+
+    #[tokio::test]
+    async fn parses_cache_read_tokens_but_never_reports_cache_writes() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 6,
+                    "prompt_tokens_details": {"cached_tokens": 8}
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAiCompatibleProvider::new(server.uri(), "test-key", "local-model", HashMap::new());
+
+        let resp = provider
+            .complete(ModelRequest {
+                model: "local-model".to_string(),
+                system: None,
+                messages: vec![ChatMessage::user_text("hi")],
+                tools: vec![],
+                max_tokens: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.usage.cache_read_tokens, Some(8));
+        assert_eq!(resp.usage.cache_write_tokens, None);
+    }
+
+    #[tokio::test]
+    async fn cache_read_tokens_is_none_when_the_wire_response_omits_prompt_tokens_details() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 6}
+            })))
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAiCompatibleProvider::new(server.uri(), "test-key", "local-model", HashMap::new());
+
+        let resp = provider
+            .complete(ModelRequest {
+                model: "local-model".to_string(),
+                system: None,
+                messages: vec![ChatMessage::user_text("hi")],
+                tools: vec![],
+                max_tokens: 100,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resp.usage.cache_read_tokens, None);
+        assert_eq!(resp.usage.cache_write_tokens, None);
     }
 
     #[tokio::test]

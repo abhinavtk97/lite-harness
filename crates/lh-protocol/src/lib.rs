@@ -180,6 +180,11 @@ pub enum PrimarySelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateResult {
     pub session_id: lh_event::SessionId,
+    /// The active model's context window, when the operator has configured
+    /// one (`ModelProviderConfig::context_window`) -- a manual figure, not
+    /// auto-discovered, so `None` when unset rather than a guess.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

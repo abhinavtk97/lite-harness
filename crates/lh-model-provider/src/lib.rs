@@ -140,6 +140,17 @@ pub enum StopReason {
 pub struct ModelUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Tokens served from a prompt cache instead of being reprocessed --
+    /// populated by `AnthropicProtocolProvider` (`cache_read_input_tokens`)
+    /// and `OpenAiCompatibleProvider` (`usage.prompt_tokens_details.cached_tokens`).
+    pub cache_read_tokens: Option<u64>,
+    /// Tokens written into a prompt cache for future reuse. Anthropic's
+    /// explicit cache-control blocks report this
+    /// (`cache_creation_input_tokens`); OpenAI-compatible APIs cache
+    /// automatically/transparently and never report a write count, so this
+    /// stays `None` for that protocol always -- not a bug, a real protocol
+    /// difference.
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Builds the concrete provider for a config entry, reading its API key
