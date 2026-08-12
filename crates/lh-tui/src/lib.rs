@@ -13,4 +13,5 @@ pub mod dispatch;
 pub mod input;
 pub mod markdown;
 pub mod mouse;
+pub mod theme;
 pub mod ui;

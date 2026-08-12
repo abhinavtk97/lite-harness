@@ -16,6 +16,8 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::theme;
+
 /// Parses `text` as Markdown and renders it as styled lines, `base_style`
 /// applied as the starting point every span inherits from (e.g. the
 /// existing per-source-session tag color) before Markdown's own emphasis/
@@ -42,18 +44,18 @@ pub fn render(text: &str, base_style: Style) -> Vec<Line<'static>> {
                 Tag::Strikethrough => style_stack.push(style.add_modifier(Modifier::CROSSED_OUT)),
                 Tag::BlockQuote(_) => {
                     flush_line(&mut lines, &mut current);
-                    style_stack.push(style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
+                    style_stack.push(style.fg(theme::FG_MUTED).add_modifier(Modifier::ITALIC));
                     current.push(Span::styled("> ", style_stack[style_stack.len() - 1]));
                 }
                 Tag::CodeBlock(kind) => {
                     flush_line(&mut lines, &mut current);
                     in_code_block = true;
-                    style_stack.push(Style::default().fg(Color::Green));
+                    style_stack.push(Style::default().fg(theme::SUCCESS));
                     if let CodeBlockKind::Fenced(lang) = kind {
                         if !lang.is_empty() {
                             lines.push(Line::from(Span::styled(
                                 format!("```{lang}"),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(theme::FG_MUTED),
                             )));
                         }
                     }
@@ -121,13 +123,13 @@ pub fn render(text: &str, base_style: Style) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(code) => {
-                current.push(Span::styled(format!(" {code} "), style.fg(Color::Green)));
+                current.push(Span::styled(format!(" {code} "), style.fg(theme::SUCCESS)));
             }
             Event::SoftBreak => current.push(Span::styled(" ", style)),
             Event::HardBreak => flush_line(&mut lines, &mut current),
             Event::Rule => {
                 flush_line(&mut lines, &mut current);
-                lines.push(Line::from(Span::styled("\u{2500}".repeat(40), Style::default().fg(Color::DarkGray))));
+                lines.push(Line::from(Span::styled("\u{2500}".repeat(40), Style::default().fg(theme::FG_MUTED))));
             }
             _ => {}
         }
@@ -159,8 +161,8 @@ fn is_blank(line: &Line) -> bool {
 
 fn heading_color(level: HeadingLevel) -> Color {
     match level {
-        HeadingLevel::H1 | HeadingLevel::H2 => Color::Cyan,
-        _ => Color::White,
+        HeadingLevel::H1 | HeadingLevel::H2 => theme::ACCENT,
+        _ => theme::FG,
     }
 }
 
@@ -210,7 +212,7 @@ mod tests {
         let lines = render_plain("run `echo hi` now");
         let line = &lines[0];
         let code_span = line.spans.iter().find(|s| s.content.contains("echo hi")).expect("code span");
-        assert_eq!(code_span.style.fg, Some(Color::Green));
+        assert_eq!(code_span.style.fg, Some(theme::SUCCESS));
     }
 
     #[test]
@@ -252,7 +254,7 @@ mod tests {
         let lines = render_plain("> quoted text");
         let line = lines.iter().find(|l| text_of(l).contains("quoted text")).expect("quote line");
         assert!(text_of(line).starts_with("> "));
-        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(line.spans[0].style.fg, Some(theme::FG_MUTED));
     }
 
     #[test]

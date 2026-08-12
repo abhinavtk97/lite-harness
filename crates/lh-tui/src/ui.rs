@@ -3,14 +3,15 @@
 //! what lets it be tested against `ratatui::backend::TestBackend` with no
 //! real terminal and no daemon connection (see `tests` below).
 
-use lh_event::{ChildKind, ChildOutcome, PermissionAction, PlanStepStatus};
+use lh_event::{ChildKind, ChildOutcome, PermissionAction, PlanStepStatus, ToolCallStatus};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{describe_permission_action, App, ConnPhase, PendingPermission, PermissionChoice, TranscriptItem};
+use crate::theme;
 
 /// Highest input box height (in text lines, before the +2 for borders) --
 /// a multi-line prompt can grow the input box, but not so far that it
@@ -28,7 +29,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // screen reads, since it's pure box-drawing-character density, not
     // color or content. Each pane below draws at most a thin one-sided
     // divider against this frame's inside, not a border of its own.
-    let outer = Block::default().borders(Borders::ALL).title(" lite-harness ");
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::FG_MUTED))
+        .title(Span::styled(" lite-harness ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)));
     let inner = outer.inner(frame.area());
     frame.render_widget(outer, frame.area());
 
@@ -94,14 +99,18 @@ fn draw_autocomplete_dropdown(frame: &mut Frame, input_area: Rect, app: &App) {
         .enumerate()
         .map(|(i, c)| {
             let style = if i == selected {
-                Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::Black).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(theme::FG)
             };
             Line::from(Span::styled(format!("/{}  {}", c.name, c.usage), style))
         })
         .collect();
-    let block = Block::default().borders(Borders::ALL).title(" commands ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(" commands ");
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -171,7 +180,8 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::WARNING))
         .title(" permission requested ");
     frame.render_widget(block, popup);
 
@@ -180,15 +190,15 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             format!("{:?} risk -- {}", pending.request.risk_tier, crate::app::source_label(&pending.request.tool_source)),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(describe_permission_action(&pending.request.action)),
+        Line::from(Span::styled(describe_permission_action(&pending.request.action), Style::default().fg(theme::FG))),
     ];
     if let PermissionAction::FileWrite { diff_summary: Some(diff), .. } = &pending.request.action {
         lines.push(Line::from(""));
         for diff_line in diff.lines() {
-            lines.push(Line::from(Span::styled(diff_line.to_string(), Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(diff_line.to_string(), diff_line_style(diff_line))));
         }
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content_area);
@@ -196,9 +206,9 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
     let option_rects = permission_option_rects(options_row);
     for (i, choice) in PermissionChoice::ALL.iter().enumerate() {
         let style = if i == pending.selected {
-            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Black).bg(theme::ACCENT).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            Style::default().fg(theme::FG_MUTED)
         };
         let label = Paragraph::new(Line::from(Span::styled(choice.label(), style))).alignment(Alignment::Center);
         frame.render_widget(label, option_rects[i]);
@@ -206,10 +216,25 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
 
     let hint = Paragraph::new(Line::from(Span::styled(
         "\u{2191}\u{2193}/click choose \u{b7} enter confirm \u{b7} y/n/a/d",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme::FG_MUTED),
     )))
     .alignment(Alignment::Center);
     frame.render_widget(hint, hint_row);
+}
+
+/// A unified-diff line's style -- `+`/`-` lines get the matching tinted
+/// background (GitHub/Claude-Code-style), anything else (context lines,
+/// `@@` hunk headers) stays plain and muted. A `diff_summary` is a plain
+/// string, not a parsed diff, so this is a per-line prefix check rather
+/// than anything richer.
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with('+') {
+        Style::default().fg(theme::DIFF_ADD_FG).bg(theme::DIFF_ADD_BG)
+    } else if line.starts_with('-') {
+        Style::default().fg(theme::DIFF_REMOVE_FG).bg(theme::DIFF_REMOVE_BG)
+    } else {
+        Style::default().fg(theme::FG_MUTED)
+    }
 }
 
 /// The sidebar is additive: with nothing to show yet (no plan, no child
@@ -243,9 +268,9 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         )));
         for step in &app.plan_steps {
             let (mark, style) = match step.status {
-                PlanStepStatus::Completed => ("[x]", Style::default().fg(Color::Green)),
-                PlanStepStatus::InProgress => ("[.]", Style::default().fg(Color::Yellow)),
-                PlanStepStatus::Pending => ("[ ]", Style::default().fg(Color::DarkGray)),
+                PlanStepStatus::Completed => ("[x]", Style::default().fg(theme::SUCCESS)),
+                PlanStepStatus::InProgress => ("[.]", Style::default().fg(theme::WARNING)),
+                PlanStepStatus::Pending => ("[ ]", Style::default().fg(theme::FG_MUTED)),
             };
             lines.push(Line::from(Span::styled(format!("{mark} {}", step.description), style)));
         }
@@ -262,10 +287,10 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 ChildKind::Delegated { agent } => format!("acp:{agent:?}"),
             };
             let (mark, style) = match &child.outcome {
-                None => ("...", Style::default().fg(Color::Yellow)),
-                Some(ChildOutcome::Success { .. }) => ("ok", Style::default().fg(Color::Green)),
-                Some(ChildOutcome::Failed { .. }) => ("fail", Style::default().fg(Color::Red)),
-                Some(ChildOutcome::Cancelled) => ("cancelled", Style::default().fg(Color::DarkGray)),
+                None => ("...", Style::default().fg(theme::WARNING)),
+                Some(ChildOutcome::Success { .. }) => ("ok", Style::default().fg(theme::SUCCESS)),
+                Some(ChildOutcome::Failed { .. }) => ("fail", Style::default().fg(theme::DANGER)),
+                Some(ChildOutcome::Cancelled) => ("cancelled", Style::default().fg(theme::FG_MUTED)),
             };
             lines.push(Line::from(Span::styled(format!("{mark} {label}"), style)));
         }
@@ -278,9 +303,9 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(Span::styled("background", Style::default().add_modifier(Modifier::BOLD))));
         for proc in &app.background_bash {
             let (mark, style) = if proc.running {
-                ("running", Style::default().fg(Color::Yellow))
+                ("running", Style::default().fg(theme::WARNING))
             } else {
-                ("done", Style::default().fg(Color::Green))
+                ("done", Style::default().fg(theme::SUCCESS))
             };
             // Bash ids are full UUIDs (see `handle_one_tool_call`'s
             // `bash_background` arm) -- an 8-char prefix is plenty to tell
@@ -294,7 +319,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     // box of its own -- each section's own bold header ("tasks 2/5",
     // "sessions", "background") already says what it is, so there's no
     // separate "activity" title to keep in sync with them.
-    let block = Block::default().borders(Borders::LEFT).border_style(Style::default().fg(Color::DarkGray));
+    let block = Block::default().borders(Borders::LEFT).border_style(Style::default().fg(theme::FG_MUTED));
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -330,28 +355,35 @@ fn transcript_lines(item: &TranscriptItem) -> Vec<Line<'static>> {
         // Markdown -- it's plain intent, not authored/formatted content,
         // and re-flowing exactly what someone just typed would surprise
         // them more than it'd help.
-        TranscriptItem::User(text) => wrapped_lines(text, "you", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        TranscriptItem::Agent(text) => markdown_lines(text, "", Style::default()),
-        TranscriptItem::Thought(text) => markdown_lines(text, "thinking", Style::default().fg(Color::DarkGray)),
+        TranscriptItem::User(text) => wrapped_lines(text, "you", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+        TranscriptItem::Agent(text) => markdown_lines(text, "", Style::default().fg(theme::FG)),
+        TranscriptItem::Thought(text) => markdown_lines(text, "thinking", Style::default().fg(theme::ACCENT_ALT)),
+        // A filled bullet plus an indented tree-branch continuation for its
+        // matching status update, rather than "->"/"<-" arrows -- the same
+        // shape modern agent CLIs (Claude Code, Codex) use for tool-call
+        // activity: `● tool_name [source]` then `  \u{2514} Status` under it.
         TranscriptItem::ToolCall { tool_name, source } => {
             vec![Line::from(Span::styled(
-                format!("  -> {tool_name} [{source}]"),
-                Style::default().fg(Color::Yellow),
+                format!("\u{25cf} {tool_name} [{source}]"),
+                Style::default().fg(theme::ACCENT_ALT),
             ))]
         }
         TranscriptItem::ToolCallUpdate { status } => {
-            vec![Line::from(Span::styled(
-                format!("  <- {status:?}"),
-                Style::default().fg(Color::Yellow),
-            ))]
+            let color = match status {
+                ToolCallStatus::Completed => theme::SUCCESS,
+                ToolCallStatus::Failed => theme::DANGER,
+                ToolCallStatus::Cancelled => theme::FG_MUTED,
+                ToolCallStatus::Pending | ToolCallStatus::InProgress => theme::WARNING,
+            };
+            vec![Line::from(Span::styled(format!("  \u{2514} {status:?}"), Style::default().fg(color)))]
         }
         TranscriptItem::System(text) => vec![Line::from(Span::styled(
             format!("  [{text}]"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::FG_MUTED),
         ))],
         TranscriptItem::Error(text) => vec![Line::from(Span::styled(
             format!("  [error] {text}"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::DANGER).add_modifier(Modifier::BOLD),
         ))],
     }
 }
@@ -384,7 +416,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     // bar, and a `"> "` prompt glyph plus a dim contextual placeholder
     // (shown only while empty) carries the "this is where you type" signal
     // instead.
-    let block = Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray));
+    let block = Block::default().borders(Borders::TOP).border_style(Style::default().fg(theme::FG_MUTED));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -392,14 +424,18 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         // The permission modal (drawn on top, see `draw`) is the actual UI
         // for that decision now -- this just needs to read as "not your
         // turn" the same way any other non-editable state does.
-        let waiting = Paragraph::new(Line::from(Span::styled("waiting...", Style::default().fg(Color::DarkGray))));
+        let waiting = Paragraph::new(Line::from(Span::styled("waiting...", Style::default().fg(theme::FG_MUTED))));
         frame.render_widget(waiting, inner);
         return;
     }
 
-    let dim = Style::default().fg(Color::DarkGray);
+    // A colored, bold prompt glyph -- the same "give the prompt character
+    // its own accent color" touch a themed shell prompt uses -- with the
+    // typed (or placeholder) text in a plainer style.
+    let glyph = Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme::FG_MUTED);
     let lines: Vec<Line> = if app.input.is_empty() {
-        vec![Line::from(vec![Span::styled("> ", dim), Span::styled("message, or / for commands", dim)])]
+        vec![Line::from(vec![Span::styled("> ", glyph), Span::styled("message, or / for commands", dim)])]
     } else {
         // Only the first visual line gets the `"> "` prompt glyph -- a
         // multi-line prompt (Alt+Enter) shouldn't repeat it on every line,
@@ -410,9 +446,9 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
             .enumerate()
             .map(|(i, line)| {
                 if i == 0 {
-                    Line::from(vec![Span::styled("> ", dim), Span::raw(line.to_string())])
+                    Line::from(vec![Span::styled("> ", glyph), Span::styled(line.to_string(), Style::default().fg(theme::FG))])
                 } else {
-                    Line::from(line.to_string())
+                    Line::from(Span::styled(line.to_string(), Style::default().fg(theme::FG)))
                 }
             })
             .collect()
@@ -426,8 +462,8 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     let (phase_label, phase_color) = match app.phase {
-        ConnPhase::Connecting => ("connecting", Color::Yellow),
-        ConnPhase::Ready => ("ready", Color::Green),
+        ConnPhase::Connecting => ("connecting", theme::WARNING),
+        ConnPhase::Ready => ("ready", theme::SUCCESS),
     };
     // `app.status` carries genuinely extra information some of the time
     // ("connected" mid-handshake, "turn complete: EndTurn" after a prompt)
@@ -447,7 +483,10 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     let left = Line::from(vec![
         Span::styled("\u{25cf} ", Style::default().fg(phase_color)),
-        Span::raw(format!("{phase_label}{status_suffix} \u{b7} {session_short} \u{b7} Ctrl+C quit")),
+        Span::styled(
+            format!("{phase_label}{status_suffix} \u{b7} {session_short} \u{b7} Ctrl+C quit"),
+            Style::default().fg(theme::FG_MUTED),
+        ),
     ]);
     frame.render_widget(Paragraph::new(left), cols[0]);
 
@@ -459,7 +498,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             None => "$?".to_string(),
         })
         .unwrap_or_else(|| "-".to_string());
-    frame.render_widget(Paragraph::new(Line::from(cost)).alignment(Alignment::Right), cols[1]);
+    let cost_style = if app.last_ledger.is_some() { Style::default().fg(theme::ACCENT_ALT) } else { Style::default().fg(theme::FG_MUTED) };
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(cost, cost_style))).alignment(Alignment::Right), cols[1]);
 }
 
 #[cfg(test)]
@@ -586,6 +626,26 @@ mod tests {
         assert!(buffer_contains(&backend, "write src/main.rs"));
         assert!(buffer_contains(&backend, "-old line"));
         assert!(buffer_contains(&backend, "+new line"));
+    }
+
+    #[test]
+    fn diff_lines_get_github_style_added_removed_background_highlighting() {
+        assert_eq!(diff_line_style("+new line").bg, Some(theme::DIFF_ADD_BG));
+        assert_eq!(diff_line_style("+new line").fg, Some(theme::DIFF_ADD_FG));
+        assert_eq!(diff_line_style("-old line").bg, Some(theme::DIFF_REMOVE_BG));
+        assert_eq!(diff_line_style("-old line").fg, Some(theme::DIFF_REMOVE_FG));
+        // A context/hunk-header line (neither + nor -) gets neither tint.
+        assert_eq!(diff_line_style("@@ -1,2 +1,2 @@").bg, None);
+    }
+
+    #[test]
+    fn a_tool_call_renders_as_a_bulleted_line_with_its_status_as_a_tree_branch_beneath_it() {
+        let mut app = App::new();
+        app.transcript.push(TranscriptItem::ToolCall { tool_name: "bash".to_string(), source: "native:bash".to_string() });
+        app.transcript.push(TranscriptItem::ToolCallUpdate { status: lh_event::ToolCallStatus::Completed });
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "\u{25cf} bash [native:bash]"), "tool call gets a bullet, not an arrow");
+        assert!(buffer_contains(&backend, "\u{2514} Completed"), "its status update gets a tree-branch marker beneath it");
     }
 
     #[test]
