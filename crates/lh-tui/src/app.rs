@@ -199,6 +199,10 @@ pub struct App {
     /// arms) -- lets someone dismiss the suggestions without deleting what
     /// they've already typed.
     pub autocomplete_dismissed: bool,
+    /// `Ctrl+B` toggles this -- lets the sidebar be collapsed to give the
+    /// transcript full width, on top of `ui::draw_main`'s existing "only
+    /// show it once there's something to show" rule.
+    pub sidebar_visible: bool,
 }
 
 impl App {
@@ -224,6 +228,7 @@ impl App {
             last_event_session: None,
             autocomplete_selected: 0,
             autocomplete_dismissed: false,
+            sidebar_visible: true,
         }
     }
 

@@ -138,6 +138,14 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
         return Ok(());
     }
 
+    // Toggles regardless of app state (typing, waiting, or mid-permission),
+    // same as Ctrl+C above -- collapsing the sidebar to reclaim width for
+    // the transcript isn't specific to any one mode.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('b') {
+        app.sidebar_visible = !app.sidebar_visible;
+        return Ok(());
+    }
+
     if app.pending_permission.is_some() {
         // Left/Right/Up/Down move the modal's highlight and Enter confirms
         // whatever's currently highlighted (defaults to Deny -- see
@@ -341,6 +349,10 @@ fn help_text() -> String {
     for c in crate::app::SLASH_COMMANDS {
         text.push_str(&format!("  /{} - {}", c.name, c.usage));
     }
+    // Keybindings that used to be spelled out permanently in the input
+    // box's own title now live here instead, alongside Ctrl+B, which has no
+    // other discoverable home now that the sidebar has no title of its own.
+    text.push_str("  |  keys: Enter send, Alt+Enter newline, Tab complete, Ctrl+B toggle sidebar");
     text
 }
 
@@ -558,6 +570,19 @@ mod tests {
         handle_key(&mut app, &mut client, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)).await.unwrap();
 
         assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_b_toggles_the_sidebar_regardless_of_app_state() {
+        let mut app = App::new(); // still Connecting -- toggling shouldn't require a ready session
+        let mut client = inert_client().await;
+        assert!(app.sidebar_visible, "visible by default");
+
+        handle_key(&mut app, &mut client, KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)).await.unwrap();
+        assert!(!app.sidebar_visible);
+
+        handle_key(&mut app, &mut client, KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)).await.unwrap();
+        assert!(app.sidebar_visible, "toggles back on the second press");
     }
 
     fn pending_permission_app() -> App {

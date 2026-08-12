@@ -23,11 +23,23 @@ const MAX_INPUT_LINES: u16 = 5;
 const SIDEBAR_WIDTH: u16 = 30;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    // One outer frame for the whole terminal instead of every pane getting
+    // its own full box border -- the single biggest lever on how "busy" the
+    // screen reads, since it's pure box-drawing-character density, not
+    // color or content. Each pane below draws at most a thin one-sided
+    // divider against this frame's inside, not a border of its own.
+    let outer = Block::default().borders(Borders::ALL).title(" lite-harness ");
+    let inner = outer.inner(frame.area());
+    frame.render_widget(outer, frame.area());
+
     let input_lines = (app.input.line_count() as u16).min(MAX_INPUT_LINES);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(input_lines + 2), Constraint::Length(1)])
-        .split(frame.area());
+        // The input box now only has a top divider (no bottom border of its
+        // own -- the outer frame supplies the screen's actual bottom edge),
+        // so it needs one fewer row than the old `+ 2`.
+        .constraints([Constraint::Min(3), Constraint::Length(input_lines + 1), Constraint::Length(1)])
+        .split(inner);
 
     draw_main(frame, chunks[0], app);
     draw_input(frame, chunks[1], app);
@@ -43,9 +55,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_autocomplete_dropdown(frame, chunks[1], app);
     }
 
-    // Drawn last, over everything else -- a modal, not another pane.
+    // Drawn last, over everything else -- a modal, not another pane. Centered
+    // against `inner`, not `frame.area()`, so it's centered within the outer
+    // frame's own border rather than including it.
     if let Some(pending) = &app.pending_permission {
-        draw_permission_modal(frame, frame.area(), pending);
+        draw_permission_modal(frame, inner, pending);
     }
 }
 
@@ -191,7 +205,7 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
     }
 
     let hint = Paragraph::new(Line::from(Span::styled(
-        "click or left/right to choose, enter to confirm (y/n/a/d shortcuts)",
+        "\u{2191}\u{2193}/click choose \u{b7} enter confirm \u{b7} y/n/a/d",
         Style::default().fg(Color::DarkGray),
     )))
     .alignment(Alignment::Center);
@@ -200,9 +214,12 @@ fn draw_permission_modal(frame: &mut Frame, area: Rect, pending: &PendingPermiss
 
 /// The sidebar is additive: with nothing to show yet (no plan, no child
 /// sessions) the transcript alone fills the whole row, exactly like before
-/// this phase -- it only appears once there's something worth showing.
+/// this phase -- it only appears once there's something worth showing, and
+/// (new this phase) only while `app.sidebar_visible` -- `Ctrl+B` toggles it
+/// off to reclaim the width for the transcript.
 fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
-    if app.plan_steps.is_empty() && app.child_sessions.is_empty() && app.background_bash.is_empty() {
+    let has_content = !app.plan_steps.is_empty() || !app.child_sessions.is_empty() || !app.background_bash.is_empty();
+    if !has_content || !app.sidebar_visible {
         draw_transcript(frame, area, app);
         return;
     }
@@ -219,7 +236,11 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
 
     if !app.plan_steps.is_empty() {
-        lines.push(Line::from(Span::styled("plan", Style::default().add_modifier(Modifier::BOLD))));
+        let done = app.plan_steps.iter().filter(|s| s.status == PlanStepStatus::Completed).count();
+        lines.push(Line::from(Span::styled(
+            format!("tasks {done}/{}", app.plan_steps.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         for step in &app.plan_steps {
             let (mark, style) = match step.status {
                 PlanStepStatus::Completed => ("[x]", Style::default().fg(Color::Green)),
@@ -269,7 +290,11 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let block = Block::default().borders(Borders::ALL).title(" activity ");
+    // A thin left divider against the outer frame's own border, not a full
+    // box of its own -- each section's own bold header ("tasks 2/5",
+    // "sessions", "background") already says what it is, so there's no
+    // separate "activity" title to keep in sync with them.
+    let block = Block::default().borders(Borders::LEFT).border_style(Style::default().fg(Color::DarkGray));
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -284,18 +309,18 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // wrapping calculation just to count rows -- not worth it for what's
     // still a readable, correct-direction scroll experience.
     let total = lines.len() as u16;
-    // Borders eat 2 rows; `area.height` can theoretically be 0 or 1 in a
-    // very small terminal, so this is saturating throughout rather than
-    // assuming there's always room for content.
-    let viewport = area.height.saturating_sub(2);
+    // No border of its own anymore (the outer frame supplies the screen's
+    // real edges), so the full `area.height` is available -- `area.height`
+    // can theoretically still be 0 in a very small terminal, so this stays
+    // saturating throughout rather than assuming there's always room.
+    let viewport = area.height;
     let max_scroll = total.saturating_sub(viewport);
     // `app.transcript_scroll` counts lines scrolled *up* from the bottom;
     // ratatui's `Paragraph::scroll` counts lines skipped from the *top* --
     // converting here is what lets `App` stay ignorant of screen height.
     let scroll_from_top = max_scroll.saturating_sub(app.transcript_scroll.min(max_scroll));
 
-    let block = Block::default().borders(Borders::ALL).title(" lite-harness ");
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((scroll_from_top, 0));
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll_from_top, 0));
     frame.render_widget(paragraph, area);
 }
 
@@ -352,39 +377,80 @@ fn markdown_lines(text: &str, label: &str, base_style: Style) -> Vec<Line<'stati
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    // The permission modal (drawn on top, see `draw`) is the actual UI for
-    // that decision now -- this just needs to read as "not your turn" the
-    // same way any other non-editable state does, not duplicate the modal's
-    // own prompt.
-    let title = if !app.input_enabled() {
-        " waiting... "
-    } else {
-        " prompt (Enter to send, Alt+Enter for a new line) "
-    };
-    let style = if app.input_enabled() {
-        Style::default()
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let paragraph = Paragraph::new(app.input.text()).style(style).block(block);
-    frame.render_widget(paragraph, area);
+    // Just a top divider against the outer frame now, not a titled box of
+    // its own -- the old title spelled out its own keybindings
+    // ("prompt (Enter to send, Alt+Enter for a new line)") on literally
+    // every frame; that information now lives in `/help` and the status
+    // bar, and a `"> "` prompt glyph plus a dim contextual placeholder
+    // (shown only while empty) carries the "this is where you type" signal
+    // instead.
+    let block = Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    if app.input_enabled() {
-        let (col, row) = app.input.cursor_row_col();
-        frame.set_cursor_position((area.x + 1 + col, area.y + 1 + row));
+    if !app.input_enabled() {
+        // The permission modal (drawn on top, see `draw`) is the actual UI
+        // for that decision now -- this just needs to read as "not your
+        // turn" the same way any other non-editable state does.
+        let waiting = Paragraph::new(Line::from(Span::styled("waiting...", Style::default().fg(Color::DarkGray))));
+        frame.render_widget(waiting, inner);
+        return;
     }
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let lines: Vec<Line> = if app.input.is_empty() {
+        vec![Line::from(vec![Span::styled("> ", dim), Span::styled("message, or / for commands", dim)])]
+    } else {
+        // Only the first visual line gets the `"> "` prompt glyph -- a
+        // multi-line prompt (Alt+Enter) shouldn't repeat it on every line,
+        // same as how a real shell only prompts once per command.
+        app.input
+            .text()
+            .split('\n')
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    Line::from(vec![Span::styled("> ", dim), Span::raw(line.to_string())])
+                } else {
+                    Line::from(line.to_string())
+                }
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let (col, row) = app.input.cursor_row_col();
+    let x_offset = if row == 0 { 2 } else { 0 };
+    frame.set_cursor_position((inner.x + x_offset + col, inner.y + row));
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let session = app
-        .session_id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let phase = match app.phase {
-        ConnPhase::Connecting => "connecting",
-        ConnPhase::Ready => "ready",
+    let (phase_label, phase_color) = match app.phase {
+        ConnPhase::Connecting => ("connecting", Color::Yellow),
+        ConnPhase::Ready => ("ready", Color::Green),
     };
+    // `app.status` carries genuinely extra information some of the time
+    // ("connected" mid-handshake, "turn complete: EndTurn" after a prompt)
+    // but is often just a prose restatement of `phase` itself
+    // ("connecting...", "ready") -- shown only when it isn't, so the phase
+    // bullet's own color+word doesn't get echoed right next to itself.
+    let status_suffix =
+        if app.status.starts_with(phase_label) { String::new() } else { format!(" \u{b7} {}", app.status) };
+    // A short id (mirrors a git short SHA) instead of the full UUID -- still
+    // enough to tell sessions apart at a glance without dominating the line.
+    let session_short = app.session_id.map(|id| id.to_string()[..8].to_string()).unwrap_or_else(|| "-".to_string());
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(12)])
+        .split(area);
+
+    let left = Line::from(vec![
+        Span::styled("\u{25cf} ", Style::default().fg(phase_color)),
+        Span::raw(format!("{phase_label}{status_suffix} \u{b7} {session_short} \u{b7} Ctrl+C quit")),
+    ]);
+    frame.render_widget(Paragraph::new(left), cols[0]);
+
     let cost = app
         .last_ledger
         .as_ref()
@@ -393,11 +459,7 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             None => "$?".to_string(),
         })
         .unwrap_or_else(|| "-".to_string());
-    let line = Line::from(vec![
-        Span::styled(format!(" {phase} "), Style::default().fg(Color::Green)),
-        Span::raw(format!("| session {session} | cost {cost} | {} | Ctrl+C to quit", app.status)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(Paragraph::new(Line::from(cost)).alignment(Alignment::Right), cols[1]);
 }
 
 #[cfg(test)]
@@ -555,6 +617,30 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_input_box_shows_a_contextual_placeholder_not_a_verbose_title() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "message, or / for commands"));
+        assert!(
+            !buffer_contains(&backend, "Enter to send"),
+            "the old always-on title's own keybinding explanation should be gone"
+        );
+    }
+
+    #[test]
+    fn typed_input_shows_a_prompt_glyph_and_hides_the_placeholder() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        for c in "hello".chars() {
+            app.input.insert_char(c);
+        }
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "> hello"));
+        assert!(!buffer_contains(&backend, "message, or / for commands"));
+    }
+
+    #[test]
     fn typing_a_slash_shows_the_autocomplete_dropdown_with_every_command() {
         let mut app = App::new();
         app.phase = ConnPhase::Ready;
@@ -637,7 +723,19 @@ mod tests {
     fn with_nothing_to_show_the_sidebar_stays_hidden() {
         let app = App::new();
         let backend = render(&app);
-        assert!(!buffer_contains(&backend, "activity"), "no plan, no child sessions -- no sidebar yet");
+        assert!(!buffer_contains(&backend, "tasks"), "no plan, no child sessions -- no sidebar yet");
+        assert!(!buffer_contains(&backend, "background"));
+        assert!(!buffer_contains(&backend, "sessions"));
+    }
+
+    #[test]
+    fn ctrl_b_hides_the_sidebar_even_with_content_to_show() {
+        let mut app = App::new();
+        app.background_bash.push(crate::app::BackgroundBash { id: "xyz".to_string(), running: true });
+        assert!(buffer_contains(&render(&app), "background"), "sanity check: visible by default");
+
+        app.sidebar_visible = false;
+        assert!(!buffer_contains(&render(&app), "background"), "Ctrl+B (via App::sidebar_visible) should hide it");
     }
 
     #[test]
@@ -648,7 +746,7 @@ mod tests {
             lh_event::PlanStep { description: "write the code".to_string(), status: lh_event::PlanStepStatus::InProgress },
         ];
         let backend = render(&app);
-        assert!(buffer_contains(&backend, "activity"));
+        assert!(buffer_contains(&backend, "tasks 1/2"), "the header should summarize completion count");
         assert!(buffer_contains(&backend, "[x] write the tests"));
         assert!(buffer_contains(&backend, "[.] write the code"));
     }
@@ -690,14 +788,32 @@ mod tests {
         app.background_bash.push(crate::app::BackgroundBash { id: "xyz".to_string(), running: true });
 
         let backend = render(&app);
-        assert!(buffer_contains(&backend, "activity"), "no plan, no child sessions, but background alone must still show it");
+        assert!(
+            buffer_contains(&backend, "background"),
+            "no plan, no child sessions, but background alone must still show it"
+        );
+    }
+
+    /// The status bar sits just inside the outer frame's bottom border (the
+    /// screen's actual last row is that border itself) -- isolating just
+    /// that row, rather than searching the whole buffer, is what lets this
+    /// test tell "a bare dash, right-aligned" apart from any other
+    /// dash-like character that might appear elsewhere on screen.
+    fn status_line_text(backend: &TestBackend) -> String {
+        let buffer = backend.buffer();
+        let y = buffer.area.height - 2;
+        let raw: String = (0..buffer.area.width).map(|x| buffer[(x, y)].symbol().to_string()).collect();
+        // Trim the outer frame's own left/right border cells, not just
+        // whitespace, so `ends_with` checks below see the status content's
+        // real trailing character.
+        raw.trim_matches(|c: char| c == '\u{2502}' || c == ' ').to_string()
     }
 
     #[test]
     fn the_status_bar_shows_a_dash_until_a_ledger_rollup_arrives_then_the_cost() {
         let mut app = App::new();
         let backend = render(&app);
-        assert!(buffer_contains(&backend, "cost -"));
+        assert!(status_line_text(&backend).ends_with('-'), "got: {:?}", status_line_text(&backend));
 
         app.last_ledger = Some(lh_ledger::LedgerRollup {
             session_id: lh_event::SessionId::now_v7(),
@@ -709,6 +825,10 @@ mod tests {
             children: Vec::new(),
         });
         let backend = render(&app);
-        assert!(buffer_contains(&backend, "cost $0.0025"));
+        assert!(
+            status_line_text(&backend).trim_end().ends_with("$0.0025"),
+            "got: {:?}",
+            status_line_text(&backend)
+        );
     }
 }
