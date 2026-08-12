@@ -168,6 +168,49 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
         return Ok(());
     }
 
+    // Slash-command autocomplete: while the input is still just a `/`-prefixed
+    // command name being typed (no args yet) and hasn't been dismissed this
+    // keystroke, Up/Down/Tab/Esc are claimed by the dropdown instead of their
+    // normal behavior (scroll / nothing / nothing), and Enter snaps the input
+    // to the highlighted candidate before falling through to the normal
+    // submit handling below. Checked after the permission-modal branch above
+    // but before the unconditional scroll block that follows -- the same
+    // priority carve-out that branch already uses.
+    if app.input_enabled() && !app.autocomplete_dismissed {
+        let candidates = crate::app::command_candidates(&app.input.text());
+        if !candidates.is_empty() {
+            let selected = app.autocomplete_selected.min(candidates.len() - 1);
+            match key.code {
+                KeyCode::Up => {
+                    app.cycle_autocomplete_selection(false, candidates.len());
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    app.cycle_autocomplete_selection(true, candidates.len());
+                    return Ok(());
+                }
+                KeyCode::Tab => {
+                    app.input.set_text(&format!("/{} ", candidates[selected].name));
+                    return Ok(());
+                }
+                KeyCode::Esc => {
+                    app.autocomplete_dismissed = true;
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    let already_exact = app.input.text().trim() == format!("/{}", candidates[selected].name);
+                    if !already_exact {
+                        app.input.set_text(&format!("/{} ", candidates[selected].name));
+                    }
+                    // Falls through to the normal Enter-submit handling below
+                    // either way -- an exact match submits as typed, a
+                    // snapped completion submits what it was just snapped to.
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Scrolling the transcript works regardless of whether the input box
     // is currently editable (e.g. re-reading context while a turn is still
     // in flight), so it's checked before the `input_enabled()` gate below.
@@ -221,14 +264,26 @@ pub async fn handle_key(app: &mut App, client: &mut DaemonClient, key: KeyEvent)
         // Ctrl+Backspace and Ctrl+W both do readline's word-delete --
         // terminals vary in whether they send a distinguishable
         // Ctrl+Backspace at all, so Ctrl+W is the reliable one of the two.
-        KeyCode::Backspace if ctrl => app.input.delete_word_before_cursor(),
-        KeyCode::Char('w') if ctrl => app.input.delete_word_before_cursor(),
-        KeyCode::Backspace => app.input.backspace(),
+        KeyCode::Backspace if ctrl => {
+            app.input.delete_word_before_cursor();
+            app.autocomplete_dismissed = false;
+        }
+        KeyCode::Char('w') if ctrl => {
+            app.input.delete_word_before_cursor();
+            app.autocomplete_dismissed = false;
+        }
+        KeyCode::Backspace => {
+            app.input.backspace();
+            app.autocomplete_dismissed = false;
+        }
         KeyCode::Left => app.input.move_left(),
         KeyCode::Right => app.input.move_right(),
         KeyCode::Home => app.input.move_line_start(),
         KeyCode::End => app.input.move_line_end(),
-        KeyCode::Char(c) => app.input.insert_char(c),
+        KeyCode::Char(c) => {
+            app.input.insert_char(c);
+            app.autocomplete_dismissed = false;
+        }
         _ => {}
     }
     Ok(())
@@ -278,7 +333,16 @@ fn kind_label(kind: PendingKind) -> &'static str {
     }
 }
 
-const HELP_TEXT: &str = "commands: /help  /quit  /agents  /delegate <agent> <task summary...>";
+/// Built from `crate::app::SLASH_COMMANDS` (the same registry the
+/// autocomplete dropdown reads) rather than a separately hand-written
+/// string, so the two can't drift out of sync with each other.
+fn help_text() -> String {
+    let mut text = String::from("commands:");
+    for c in crate::app::SLASH_COMMANDS {
+        text.push_str(&format!("  /{} - {}", c.name, c.usage));
+    }
+    text
+}
 
 /// A typed `/`-prefixed line from the input box, dispatched instead of a
 /// `session/prompt` -- see the module-level note on why there's no
@@ -288,7 +352,7 @@ const HELP_TEXT: &str = "commands: /help  /quit  /agents  /delegate <agent> <tas
 async fn handle_slash_command(app: &mut App, client: &mut DaemonClient, command: &str) -> Result<()> {
     let mut words = command.split_whitespace();
     match words.next().unwrap_or("") {
-        "help" => app.push_system(HELP_TEXT),
+        "help" => app.push_system(help_text()),
         "quit" | "q" => app.should_quit = true,
         "agents" => app.push_system(describe_available_agents(&app.available_agents)),
         "delegate" => {
@@ -404,6 +468,16 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Types `text` one character at a time through the real `handle_key`
+    /// path (matching how a real terminal delivers keystrokes) without
+    /// submitting -- the counterpart to `submit_line` below for tests that
+    /// need to inspect state mid-typing, before any Enter.
+    async fn type_text(app: &mut App, client: &mut DaemonClient, text: &str) {
+        for c in text.chars() {
+            handle_key(app, client, key(KeyCode::Char(c))).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -737,6 +811,94 @@ mod tests {
 
         handle_key(&mut app, &mut client, key(KeyCode::PageDown)).await.unwrap();
         assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn up_down_navigate_the_autocomplete_dropdown_instead_of_scrolling_while_it_is_open() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        type_text(&mut app, &mut client, "/").await; // matches all 4 registered commands
+
+        handle_key(&mut app, &mut client, key(KeyCode::Down)).await.unwrap();
+        assert_eq!(app.autocomplete_selected, 1, "Down should cycle the dropdown");
+        assert_eq!(app.transcript_scroll, 0, "and must not also scroll the transcript");
+
+        handle_key(&mut app, &mut client, key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.autocomplete_selected, 0);
+        assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn tab_completes_the_highlighted_command_without_submitting_it() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        type_text(&mut app, &mut client, "/de").await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Tab)).await.unwrap();
+
+        assert_eq!(app.input.text(), "/delegate ");
+        assert!(app.pending.is_none(), "Tab must only fill the input, never submit");
+        assert!(app.transcript.is_empty(), "nothing should reach the transcript yet");
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_narrowed_prefix_completes_and_submits_the_command() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        type_text(&mut app, &mut client, "/ag").await; // "agents" is the only match
+
+        handle_key(&mut app, &mut client, key(KeyCode::Enter)).await.unwrap();
+
+        assert!(
+            app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::User(t) if t == "/agents ")),
+            "Enter should have snapped the input to the full command before submitting"
+        );
+        assert!(app.transcript.iter().any(|i| matches!(i, crate::app::TranscriptItem::System(t) if t.contains("no delegated agents"))));
+    }
+
+    #[tokio::test]
+    async fn enter_on_an_already_exact_command_submits_it_unchanged() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        type_text(&mut app, &mut client, "/quit").await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Enter)).await.unwrap();
+
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn escape_dismisses_the_dropdown_without_changing_the_input() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        type_text(&mut app, &mut client, "/de").await;
+
+        handle_key(&mut app, &mut client, key(KeyCode::Esc)).await.unwrap();
+        assert!(app.autocomplete_dismissed);
+        assert_eq!(app.input.text(), "/de", "Esc must not touch what was typed");
+
+        // With the dropdown dismissed, Up falls through to the normal scroll
+        // handling instead of being claimed by the (now-hidden) dropdown.
+        handle_key(&mut app, &mut client, key(KeyCode::Up)).await.unwrap();
+        assert_eq!(app.transcript_scroll, 1);
+    }
+
+    #[tokio::test]
+    async fn typing_again_after_dismissing_the_dropdown_clears_the_dismissal() {
+        let mut app = ready_app();
+        let mut client = inert_client().await;
+        type_text(&mut app, &mut client, "/de").await;
+        handle_key(&mut app, &mut client, key(KeyCode::Esc)).await.unwrap();
+        assert!(app.autocomplete_dismissed);
+
+        handle_key(&mut app, &mut client, key(KeyCode::Char('l'))).await.unwrap();
+        assert!(!app.autocomplete_dismissed);
+
+        // Tab is a no-op for plain text editing (not handled by the normal
+        // arm below), so this only succeeds if the dropdown is intercepting
+        // again -- an unambiguous signal, unlike re-checking Up/Down.
+        handle_key(&mut app, &mut client, key(KeyCode::Tab)).await.unwrap();
+        assert_eq!(app.input.text(), "/delegate ", "autocomplete should be active again after the dismissal was cleared");
     }
 
     #[tokio::test]

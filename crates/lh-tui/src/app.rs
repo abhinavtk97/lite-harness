@@ -189,6 +189,16 @@ pub struct App {
     /// never merge into one bubble, even if both happen to be `Agent`
     /// chunks back to back.
     last_event_session: Option<SessionId>,
+    /// Highlighted row in the slash-command autocomplete dropdown -- always
+    /// read through `.min(candidate_count - 1)` at the point of use rather
+    /// than reset on every keystroke, since `command_candidates` is
+    /// recomputed fresh from the input text every time anyway.
+    pub autocomplete_selected: usize,
+    /// Set by Esc while the dropdown is showing; cleared the next time the
+    /// input text actually changes (see `dispatch::handle_key`'s text-editing
+    /// arms) -- lets someone dismiss the suggestions without deleting what
+    /// they've already typed.
+    pub autocomplete_dismissed: bool,
 }
 
 impl App {
@@ -212,6 +222,8 @@ impl App {
             background_bash: Vec::new(),
             pending_tool_calls: HashMap::new(),
             last_event_session: None,
+            autocomplete_selected: 0,
+            autocomplete_dismissed: false,
         }
     }
 
@@ -387,6 +399,55 @@ impl App {
     pub fn selected_permission_choice(&self) -> Option<PermissionChoice> {
         self.pending_permission.as_ref().map(|p| PermissionChoice::ALL[p.selected])
     }
+
+    /// Moves the autocomplete dropdown's highlighted row; a no-op with no
+    /// candidates to cycle through. Wraps like `cycle_permission_selection`,
+    /// but takes the candidate count as a parameter rather than reading a
+    /// stored list, since the candidate set itself is always recomputed
+    /// fresh from `command_candidates` -- never stored on `App`.
+    pub fn cycle_autocomplete_selection(&mut self, forward: bool, candidate_count: usize) {
+        if candidate_count == 0 {
+            return;
+        }
+        self.autocomplete_selected = if forward {
+            (self.autocomplete_selected + 1) % candidate_count
+        } else {
+            (self.autocomplete_selected + candidate_count - 1) % candidate_count
+        };
+    }
+}
+
+/// One entry in the slash-command registry -- the single source of truth for
+/// both `/help`'s text (`dispatch::handle_slash_command`) and the
+/// autocomplete dropdown's contents (`ui::draw_autocomplete_dropdown`), so
+/// the two can never drift the way a hand-written help string could.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SlashCommand {
+    pub name: &'static str,
+    pub usage: &'static str,
+}
+
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand { name: "help", usage: "show this command list" },
+    SlashCommand { name: "quit", usage: "exit lite-harness-tui" },
+    SlashCommand { name: "agents", usage: "list registered delegated agents" },
+    SlashCommand { name: "delegate", usage: "<agent> <task summary...> -- hand a task to a delegated agent" },
+];
+
+/// Which `SLASH_COMMANDS` entries match `input_text` as typed so far -- only
+/// while the command *name* itself is still being typed (no whitespace yet
+/// after the leading `/`), so once a delegate's arguments start, the
+/// dropdown gets out of the way rather than keep floating over them. Pure
+/// and shared: `ui::draw` calls it to render the dropdown, `dispatch::handle_key`
+/// calls it (on the same text) to decide whether Up/Down/Tab/Enter/Esc should
+/// be intercepted for it -- exactly the `permission_popup_rect`/
+/// `permission_modal_rows` split `ui.rs` and `mouse.rs` already established.
+pub fn command_candidates(input_text: &str) -> Vec<&'static SlashCommand> {
+    let Some(rest) = input_text.strip_prefix('/') else { return Vec::new() };
+    if rest.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    SLASH_COMMANDS.iter().filter(|c| c.name.starts_with(rest)).collect()
 }
 
 /// Turns a `PermissionAction` into one readable line -- shared by the
@@ -646,6 +707,52 @@ mod tests {
         let mut app = App::new();
         app.cycle_permission_selection(true);
         assert!(app.selected_permission_choice().is_none());
+    }
+
+    #[test]
+    fn command_candidates_matches_only_commands_starting_with_the_typed_prefix() {
+        assert_eq!(command_candidates("/d").iter().map(|c| c.name).collect::<Vec<_>>(), vec!["delegate"]);
+        assert_eq!(command_candidates("/a").iter().map(|c| c.name).collect::<Vec<_>>(), vec!["agents"]);
+        assert_eq!(command_candidates("/xyz"), Vec::<&SlashCommand>::new());
+    }
+
+    #[test]
+    fn command_candidates_lists_everything_for_a_bare_slash() {
+        let names: Vec<&str> = command_candidates("/").iter().map(|c| c.name).collect();
+        assert_eq!(names.len(), SLASH_COMMANDS.len());
+        assert!(names.contains(&"help"));
+        assert!(names.contains(&"delegate"));
+    }
+
+    #[test]
+    fn command_candidates_stops_once_the_command_name_has_a_trailing_space() {
+        assert_eq!(command_candidates("/delegate "), Vec::<&SlashCommand>::new());
+        assert_eq!(command_candidates("/delegate claude-code do the thing"), Vec::<&SlashCommand>::new());
+    }
+
+    #[test]
+    fn command_candidates_is_empty_for_text_not_starting_with_a_slash() {
+        assert_eq!(command_candidates("hello there"), Vec::<&SlashCommand>::new());
+        assert_eq!(command_candidates(""), Vec::<&SlashCommand>::new());
+    }
+
+    #[test]
+    fn cycling_the_autocomplete_selection_wraps_in_both_directions() {
+        let mut app = App::new();
+        assert_eq!(app.autocomplete_selected, 0);
+        app.cycle_autocomplete_selection(true, 4);
+        assert_eq!(app.autocomplete_selected, 1);
+        app.cycle_autocomplete_selection(false, 4);
+        assert_eq!(app.autocomplete_selected, 0);
+        app.cycle_autocomplete_selection(false, 4);
+        assert_eq!(app.autocomplete_selected, 3, "wraps backward to the end");
+    }
+
+    #[test]
+    fn cycling_the_autocomplete_selection_with_no_candidates_is_a_no_op() {
+        let mut app = App::new();
+        app.cycle_autocomplete_selection(true, 0);
+        assert_eq!(app.autocomplete_selected, 0);
     }
 
     #[test]

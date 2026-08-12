@@ -108,6 +108,14 @@ impl InputBox {
         self.cursor = 0;
         text
     }
+
+    /// Replaces the buffer's contents wholesale and puts the cursor at the
+    /// end -- used by the slash-command autocomplete dropdown to fill in a
+    /// selection (Tab, or Enter on a non-exact prefix match).
+    pub fn set_text(&mut self, text: &str) {
+        self.chars = text.chars().collect();
+        self.cursor = self.chars.len();
+    }
 }
 
 #[cfg(test)]

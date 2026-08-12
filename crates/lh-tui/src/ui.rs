@@ -33,10 +33,62 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_input(frame, chunks[1], app);
     draw_status(frame, chunks[2], app);
 
+    // The permission modal takes priority when both could apply (it can't
+    // happen in practice -- typing is disabled while a permission is
+    // pending, see `App::input_enabled` -- but the dropdown reads straight
+    // from `app.input`, not from whether input is currently enabled, so this
+    // guard is what actually prevents the overlap rather than relying on
+    // that indirectly).
+    if app.pending_permission.is_none() {
+        draw_autocomplete_dropdown(frame, chunks[1], app);
+    }
+
     // Drawn last, over everything else -- a modal, not another pane.
     if let Some(pending) = &app.pending_permission {
         draw_permission_modal(frame, frame.area(), pending);
     }
+}
+
+/// A small popup listing the slash commands matching what's typed so far,
+/// anchored directly above the input box -- `input_area` is that box's own
+/// `Rect` (`chunks[1]` from `draw`), used both to align the popup's left edge
+/// and to place it just above rather than duplicating the input's own
+/// position math.
+fn draw_autocomplete_dropdown(frame: &mut Frame, input_area: Rect, app: &App) {
+    if app.autocomplete_dismissed {
+        return;
+    }
+    let candidates = crate::app::command_candidates(&app.input.text());
+    if candidates.is_empty() {
+        return;
+    }
+    let height = (candidates.len() as u16 + 2).min(input_area.y);
+    if height == 0 {
+        return;
+    }
+    let popup = Rect {
+        x: input_area.x,
+        y: input_area.y - height,
+        width: input_area.width.min(60),
+        height,
+    };
+    frame.render_widget(Clear, popup);
+
+    let selected = app.autocomplete_selected.min(candidates.len() - 1);
+    let lines: Vec<Line> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(format!("/{}  {}", c.name, c.usage), style))
+        })
+        .collect();
+    let block = Block::default().borders(Borders::ALL).title(" commands ");
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// A `Rect` centered within `area`, `percent_x`/`percent_y` of its size --
@@ -500,6 +552,63 @@ mod tests {
         let backend = render(&app);
         assert!(buffer_contains(&backend, "first line"));
         assert!(buffer_contains(&backend, "second line"));
+    }
+
+    #[test]
+    fn typing_a_slash_shows_the_autocomplete_dropdown_with_every_command() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.input.insert_char('/');
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "commands"));
+        assert!(buffer_contains(&backend, "/help"));
+        assert!(buffer_contains(&backend, "/quit"));
+        assert!(buffer_contains(&backend, "/agents"));
+        assert!(buffer_contains(&backend, "/delegate"));
+    }
+
+    #[test]
+    fn the_autocomplete_dropdown_narrows_to_matching_commands_as_you_type() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        for c in "/de".chars() {
+            app.input.insert_char(c);
+        }
+        let backend = render(&app);
+        assert!(buffer_contains(&backend, "/delegate"));
+        assert!(!buffer_contains(&backend, "/help"), "only the matching command should be listed");
+    }
+
+    #[test]
+    fn the_autocomplete_dropdown_stays_hidden_for_plain_text_input() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        for c in "hello there".chars() {
+            app.input.insert_char(c);
+        }
+        let backend = render(&app);
+        assert!(!buffer_contains(&backend, "commands"), "no leading slash -- nothing to complete");
+    }
+
+    #[test]
+    fn the_autocomplete_dropdown_disappears_once_dismissed() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.input.insert_char('/');
+        app.autocomplete_dismissed = true;
+        let backend = render(&app);
+        assert!(!buffer_contains(&backend, "commands"));
+    }
+
+    #[test]
+    fn the_autocomplete_dropdown_stays_hidden_while_a_permission_is_pending() {
+        let mut app = App::new();
+        app.phase = ConnPhase::Ready;
+        app.input.insert_char('/');
+        app.pending_permission =
+            Some(crate::app::PendingPermission { request_id: -1, request: crate::app::fake_permission_request(), selected: 0 });
+        let backend = render(&app);
+        assert!(!buffer_contains(&backend, " commands "), "the permission modal owns the screen, not the dropdown");
     }
 
     #[test]
