@@ -2124,6 +2124,95 @@ mod tests {
         assert!(joined_text.contains("How big is it"), "got: {joined_text}");
     }
 
+    #[tokio::test]
+    async fn a_tool_call_and_its_result_from_turn_1_are_carried_into_turn_2s_history() {
+        // `messages` is one Vec accumulated across a whole turn's model<->tool
+        // round-trips, and the *entire* thing gets persisted to
+        // ConversationHistory at the end (both EndTurn and MaxTurnsExceeded
+        // branches insert the same `messages`) -- so a tool call and its
+        // result should already ride along with plain text, not just the
+        // user/assistant text pair the test above covers. Proven directly
+        // here rather than only inferred from reading run_turn.
+        let workspace = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let session_id = SessionId::now_v7();
+        let history: ConversationHistory = Arc::new(AsyncMutex::new(HashMap::new()));
+        let config = AgentConfig {
+            model: "test-model".to_string(),
+            workspace_root: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        let turn1_provider = Arc::new(ScriptedModelProvider::new(vec![
+            ModelResponse {
+                content: vec![ChatContent::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "plan_update".to_string(),
+                    input: serde_json::json!({"steps": [{"description": "write the report", "status": "pending"}]}),
+                }],
+                usage: ModelUsage::default(),
+                stop_reason: StopReason::ToolUse,
+            },
+            ModelResponse {
+                content: vec![ChatContent::Text("Plan created with one step.".to_string())],
+                usage: ModelUsage::default(),
+                stop_reason: StopReason::EndTurn,
+            },
+        ]));
+        let turn1 = NativeAgentLoop::new(
+            store.clone(),
+            turn1_provider,
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            history.clone(),
+            config.clone(),
+        );
+        turn1.run_turn(session_id, "Make a plan to write the report.").await.unwrap();
+
+        let turn2_provider = Arc::new(ScriptedModelProvider::new(vec![ModelResponse {
+            content: vec![ChatContent::Text("The plan has one step: write the report.".to_string())],
+            usage: ModelUsage::default(),
+            stop_reason: StopReason::EndTurn,
+        }]));
+        let turn2 = NativeAgentLoop::new(
+            store.clone(),
+            turn2_provider.clone(),
+            Arc::new(FixedDecisionEngine(PermissionDecision::Allow)),
+            local_plane(workspace.path()).await,
+            Arc::new(lh_ledger::PricingTable::new()),
+            Arc::new(FixedPrompter(PermissionDecision::Allow)),
+            Arc::new(AsyncMutex::new(HashMap::new())),
+            history.clone(),
+            config,
+        );
+        turn2.run_turn(session_id, "What was in the plan?").await.unwrap();
+
+        let recorded = turn2_provider.recorded_requests.lock().await;
+        let request = &recorded[0];
+        assert_eq!(
+            request.messages.len(),
+            5,
+            "turn 1's user msg + tool-use assistant msg + tool-result msg + final assistant msg, \
+             plus turn 2's new user msg, got: {:?}",
+            request.messages
+        );
+
+        let has_tool_use = request.messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|c| matches!(c, ChatContent::ToolUse { name, .. } if name == "plan_update"))
+        });
+        assert!(has_tool_use, "turn 2's request is missing turn 1's plan_update tool call: {:?}", request.messages);
+
+        let has_tool_result = request.messages.iter().any(|m| {
+            m.content.iter().any(|c| matches!(c, ChatContent::ToolResult { tool_use_id, .. } if tool_use_id == "call_1"))
+        });
+        assert!(has_tool_result, "turn 2's request is missing turn 1's tool result: {:?}", request.messages);
+    }
+
     fn payload_kind(event: &Event) -> &'static str {
         match &event.payload {
             EventPayload::UserMessage { .. } => "UserMessage",
